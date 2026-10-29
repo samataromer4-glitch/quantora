@@ -1,0 +1,5235 @@
+import express from "express";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
+import dotenv from "dotenv";
+import { withSupabase, createSupabaseContext } from "@supabase/server";
+import { registerModernRoutes } from "./server/modernRoutes.ts";
+import { registerFinanceRoutes } from "./server/financeRoutes.ts";
+import {
+  getAuthenticatedUser,
+  createSessionToken,
+  hashPassword,
+  verifyPassword,
+  requireAuthenticatedRequest,
+  getSessionTokenFromRequest,
+  getSessionInfoFromRequest,
+  revokeSession,
+  validatePassword
+} from "./server/authSession.ts";
+import {
+  createRecoveryRateLimiter,
+  hashRecoveryToken,
+  requestPasswordRecovery,
+  resetPasswordWithRecoveryToken,
+  validatePasswordRecoveryToken,
+  type PasswordRecoveryAccount,
+  type PasswordRecoveryRepository
+} from "./server/passwordRecovery.ts";
+import { sendPasswordRecoveryEmail } from "./server/emailService.ts";
+
+// Load environment variables
+if (process.env.QUANTORA_SKIP_DOTENV !== "1") {
+  dotenv.config({ override: true });
+}
+
+// Normalize/Clean all Supabase-related environment variables for both SDKs
+const envKeysToClean = [
+  "SUPABASE_URL",
+  "SUPABASE_ANON_KEY",
+  "SUPABASE_PUBLISHABLE_KEY",
+  "SUPABASE_SECRET_KEY",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "SUPABASE_JWKS_URL"
+];
+for (const key of envKeysToClean) {
+  if (process.env[key]) {
+    let val = process.env[key]!.trim();
+    while ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1).trim();
+    }
+    process.env[key] = val;
+  }
+}
+
+// Normalize short/bare project IDs for SUPABASE_URL if necessary
+if (process.env.SUPABASE_URL && !process.env.SUPABASE_URL.startsWith("http")) {
+  if (!process.env.SUPABASE_URL.includes(".") && !process.env.SUPABASE_URL.includes("/")) {
+    process.env.SUPABASE_URL = `https://${process.env.SUPABASE_URL}.supabase.co`;
+  } else {
+    process.env.SUPABASE_URL = `https://${process.env.SUPABASE_URL}`;
+  }
+}
+
+function sanitizeEnvValue(val: string | undefined): string {
+  if (!val) return "";
+  let clean = val.trim();
+  while ((clean.startsWith('"') && clean.endsWith('"')) || (clean.startsWith("'") && clean.endsWith("'"))) {
+    clean = clean.slice(1, -1).trim();
+  }
+  return clean;
+}
+
+function parseSupabaseUrl(url: string | undefined): string {
+  let clean = sanitizeEnvValue(url);
+  if (!clean) return "";
+  let isSecure = true;
+  if (clean.toLowerCase().startsWith("https://")) {
+    clean = clean.slice(8);
+  } else if (clean.toLowerCase().startsWith("http://")) {
+    clean = clean.slice(7);
+    isSecure = false;
+  }
+  const slashIdx = clean.indexOf("/");
+  if (slashIdx !== -1) {
+    clean = clean.slice(0, slashIdx);
+  }
+  if (clean && !clean.includes(".")) {
+    clean = clean + ".supabase.co";
+  }
+  return (isSecure ? "https://" : "http://") + clean;
+}
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+
+// Reverse-proxy aware and hardened Express defaults.
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+// Security headers that are safe for this SPA without introducing a brittle CSP.
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=(), payment=()"
+  );
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+  if (req.secure || forwardedProto === "https") {
+    res.setHeader(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains"
+    );
+  }
+
+  if (req.path.startsWith("/api/")) {
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Pragma", "no-cache");
+  }
+  next();
+});
+
+app.use(express.json({ limit: "10mb" }));
+
+// Basic in-process abuse controls for public authentication endpoints.
+// These limits protect each runtime instance and complement the signed session design.
+type RateBucket = { count: number; resetAt: number };
+const authRateBuckets = new Map<string, RateBucket>();
+const passwordRecoveryRateLimiter = createRecoveryRateLimiter();
+const PASSWORD_RECOVERY_GENERIC_RESPONSE = {
+  success: true,
+  message: "Haddii email-ku ku xiran yahay akoon firfircoon, tilmaamaha dib-u-dejinta ayaa laguugu soo diri doonaa."
+};
+
+function consumeAuthRateLimit(key: string, maxAttempts: number, windowMs: number): {
+  allowed: boolean;
+  retryAfterSeconds: number;
+} {
+  const now = Date.now();
+  const current = authRateBuckets.get(key);
+
+  if (!current || current.resetAt <= now) {
+    authRateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return { allowed: true, retryAfterSeconds: Math.ceil(windowMs / 1000) };
+  }
+
+  current.count += 1;
+  if (current.count > maxAttempts) {
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(1, Math.ceil((current.resetAt - now) / 1000))
+    };
+  }
+
+  return {
+    allowed: true,
+    retryAfterSeconds: Math.max(1, Math.ceil((current.resetAt - now) / 1000))
+  };
+}
+
+function clearAuthRateLimit(keyPrefix: string) {
+  for (const key of authRateBuckets.keys()) {
+    if (key.startsWith(keyPrefix)) authRateBuckets.delete(key);
+  }
+}
+
+const SESSION_COOKIE_NAME = "dugsi_session";
+const SESSION_MAX_AGE_SECONDS = 12 * 60 * 60;
+
+const CAPACITOR_ALLOWED_ORIGINS = new Set([
+  "capacitor://localhost",
+  "https://localhost"
+]);
+
+function isCapacitorClient(req: express.Request): boolean {
+  const origin = String(req.headers.origin || "");
+  return CAPACITOR_ALLOWED_ORIGINS.has(origin) &&
+    String(req.headers["x-dugsi-client"] || "").toLowerCase() === "capacitor";
+}
+
+function requestIsHttps(req: express.Request): boolean {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  return req.secure || forwardedProto === "https";
+}
+
+function setSessionCookie(req: express.Request, res: express.Response, token: string) {
+  const secure = requestIsHttps(req);
+  const attributes = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${SESSION_MAX_AGE_SECONDS}`
+  ];
+
+  if (secure) attributes.push("Secure");
+  res.setHeader("Set-Cookie", attributes.join("; "));
+}
+
+function clearSessionCookie(req: express.Request, res: express.Response) {
+  const secure = requestIsHttps(req);
+  const attributes = [
+    `${SESSION_COOKIE_NAME}=;`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    "Max-Age=0"
+  ];
+
+  if (secure) attributes.push("Secure");
+  res.setHeader("Set-Cookie", attributes.join("; "));
+}
+
+// Reject cross-site state-changing API requests. Bearer auth is the primary control,
+// while this adds defense-in-depth against browser-based request forgery.
+function apiOriginAllowed(req: express.Request): boolean {
+  if (!req.headers.origin) return true;
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const forwardedHost = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+  const requestOrigin = forwardedHost
+    ? `${forwardedProto || (req.secure ? "https" : "http")}://${forwardedHost}`
+    : "";
+
+  let configuredOrigin = "";
+  try {
+    if (process.env.APP_URL) configuredOrigin = new URL(process.env.APP_URL).origin;
+  } catch {}
+
+  return req.headers.origin === requestOrigin ||
+    (!!configuredOrigin && req.headers.origin === configuredOrigin) ||
+    CAPACITOR_ALLOWED_ORIGINS.has(String(req.headers.origin || ""));
+}
+
+// Capacitor uses a fixed WebView origin. Allow only our two native origins and
+// deliberately omit Access-Control-Allow-Credentials: native API calls use Bearer tokens.
+app.use("/api", (req, res, next) => {
+  const origin = String(req.headers.origin || "");
+  if (CAPACITOR_ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dugsi-Client");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Max-Age", "600");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+  }
+  next();
+});
+
+app.use("/api", (req, res, next) => {
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && !apiOriginAllowed(req)) {
+    return res.status(403).json({ error: "Cross-site request blocked." });
+  }
+  next();
+});
+
+app.use("/api", (req, res, next) => {
+  const pathName = req.path;
+
+  if (req.method === "POST" && pathName === "/auth/login") {
+    const ip = req.ip || "unknown";
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "unknown";
+    const ipLimit = consumeAuthRateLimit(`login:ip:${ip}`, 10, 15 * 60 * 1000);
+    const accountLimit = consumeAuthRateLimit(`login:account:${ip}:${email}`, 6, 15 * 60 * 1000);
+
+    if (!ipLimit.allowed || !accountLimit.allowed) {
+      const retry = Math.max(ipLimit.retryAfterSeconds, accountLimit.retryAfterSeconds);
+      res.setHeader("Retry-After", String(retry));
+      return res.status(429).json({
+        error: "Too many login attempts. Fadlan sug wax yar kadibna mar kale isku day."
+      });
+    }
+  }
+
+  if (req.method === "POST" && pathName === "/auth/signup") {
+    const ip = req.ip || "unknown";
+    const limit = consumeAuthRateLimit(`signup:ip:${ip}`, 5, 60 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader("Retry-After", String(limit.retryAfterSeconds));
+      return res.status(429).json({
+        error: "Diiwaangelin badan ayaa laga helay cinwaankan. Fadlan sug wax yar."
+      });
+    }
+  }
+
+  if (req.method === "POST" && pathName === "/auth/password-recovery") {
+    const ip = req.ip || "unknown";
+    const globalLimit = passwordRecoveryRateLimiter.consume(
+      "request:global",
+      3000,
+      60 * 1000
+    );
+    const ipLimit = passwordRecoveryRateLimiter.consume(
+      `request:ip:${ip}`,
+      10,
+      60 * 60 * 1000
+    );
+    if (!globalLimit.allowed || !ipLimit.allowed) {
+      res.setHeader("Retry-After", String(Math.max(globalLimit.retryAfterSeconds, ipLimit.retryAfterSeconds)));
+      return res.status(429).json(PASSWORD_RECOVERY_GENERIC_RESPONSE);
+    }
+
+    const email = typeof req.body?.email === "string"
+      ? req.body.email.trim().toLowerCase()
+      : "";
+    if (email.length > 0 && email.length <= 320) {
+      const emailKey = crypto.createHash("sha256").update(email, "utf8").digest("hex");
+      const accountLimit = passwordRecoveryRateLimiter.consume(
+        `request:email:${emailKey}`,
+        3,
+        15 * 60 * 1000
+      );
+      if (!accountLimit.allowed) {
+        return res.status(202).json(PASSWORD_RECOVERY_GENERIC_RESPONSE);
+      }
+    }
+  }
+
+  if (
+    req.method === "POST" &&
+    ["/auth/password-recovery/validate", "/auth/password-reset"].includes(pathName)
+  ) {
+    const ip = req.ip || "unknown";
+    const globalLimit = passwordRecoveryRateLimiter.consume(
+      "token:global",
+      5000,
+      60 * 1000
+    );
+    const ipLimit = passwordRecoveryRateLimiter.consume(
+      `token:ip:${ip}`,
+      30,
+      15 * 60 * 1000
+    );
+    if (!globalLimit.allowed || !ipLimit.allowed) {
+      res.setHeader("Retry-After", String(Math.max(globalLimit.retryAfterSeconds, ipLimit.retryAfterSeconds)));
+      return res.status(429).json({
+        valid: false,
+        error: "Codsiyo badan ayaa la sameeyey. Fadlan sug wax yar ka hor intaadan mar kale isku dayin."
+      });
+    }
+
+    const token = typeof req.body?.token === "string" ? req.body.token : "";
+    if (token.length > 0) {
+      const tokenKey = token.length <= 256
+        ? crypto.createHash("sha256").update(token, "utf8").digest("hex")
+        : "oversized";
+      const tokenLimit = passwordRecoveryRateLimiter.consume(
+        `token:value:${tokenKey}`,
+        pathName === "/auth/password-reset" ? 5 : 10,
+        15 * 60 * 1000
+      );
+      if (!tokenLimit.allowed) {
+        res.setHeader("Retry-After", String(tokenLimit.retryAfterSeconds));
+        return res.status(429).json({
+          valid: false,
+          error: "Link-ga dib-u-dejintu ma shaqaynayo ama wuu dhacay."
+        });
+      }
+    }
+  }
+
+  if (req.method === "POST" && pathName === "/teachers/activate-account") {
+    const ip = req.ip || "unknown";
+    const limit = consumeAuthRateLimit(`activation:ip:${ip}`, 10, 60 * 60 * 1000);
+    if (!limit.allowed) {
+      res.setHeader("Retry-After", String(limit.retryAfterSeconds));
+      return res.status(429).json({
+        error: "Codsiyo badan ayaa laga helay cinwaankan. Fadlan sug wax yar."
+      });
+    }
+  }
+
+  return next();
+});
+
+// Server-side persistence must use a privileged key; a publishable/anon key
+// is intentionally not accepted as a fallback for this server database client.
+function getSupabaseServerKeyCandidates(): Array<{ source: string; value: string }> {
+  const rawCandidates = [
+    { source: "SUPABASE_SECRET_KEY", value: sanitizeEnvValue(process.env.SUPABASE_SECRET_KEY) },
+    { source: "SUPABASE_SERVICE_ROLE_KEY", value: sanitizeEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY) }
+  ];
+  const seen = new Set<string>();
+  return rawCandidates.filter((candidate) => {
+    if (!candidate.value || candidate.value.startsWith("sb_publish") || seen.has(candidate.value)) {
+      return false;
+    }
+    seen.add(candidate.value);
+    return true;
+  });
+}
+
+function deriveSupabaseKey(): string {
+  return getSupabaseServerKeyCandidates()[0]?.value || "";
+}
+
+const supabaseUrl = parseSupabaseUrl(process.env.SUPABASE_URL);
+const supabaseAnonKey = sanitizeEnvValue(process.env.SUPABASE_ANON_KEY || "");
+let supabaseActiveKey = deriveSupabaseKey();
+
+let supabase: any = null;
+try {
+  if (supabaseUrl && supabaseActiveKey) {
+    supabase = createClient(supabaseUrl, supabaseActiveKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    });
+  }
+} catch (err) {
+  console.error("Failed to initialize Supabase client:", err);
+}
+
+// ✅ NO EMAIL VERIFICATION - Auto verified
+
+// Local database fallback with read-only filesystem resilience for Cloud Run
+const PRIMARY_DB_PATH = path.join(process.cwd(), "database.json");
+const TMP_DB_PATH = path.join("/tmp", "dugsi_database.json");
+let inMemoryDB: LocalDB | null = null;
+
+interface LocalDB {
+  users: Array<{
+    email: string;
+    password_hash: string;
+    verified: boolean;
+    verification_code?: string;
+    role?: string;
+    school_id?: string;
+    teacher_id?: string;
+    session_version?: number;
+  }>;
+  passwordRecoveryTokens?: Array<{
+    tokenHash: string;
+    email: string;
+    schoolId: string;
+    role: string;
+    teacherId: string | null;
+    expiresAt: string;
+    consumedAt?: string | null;
+  }>;
+  students: Array<any>;
+  attendance: Array<{ schoolId?: string; date: string; studentId: string; status: string; timestamp: string; sessionType?: string }>;
+  fees: Array<any>;
+  classes: Array<{ id: string; schoolId?: string; className: string; teacherName: string; roomNumber: string; description: string; createdAt: string; section?: string; capacity?: number; academicYear?: string; status?: string }>;
+  subjects: Array<{ id: string; schoolId?: string; subjectName: string; subjectCode: string; className: string; teacherName: string; createdAt: string; category?: string; description?: string; passMarks?: number; maxMarks?: number; status?: string }>;
+  examScores: Array<{ id: string; schoolId?: string; studentId: string; studentName: string; className: string; subjectName: string; examName: string; term: string; maxMarks: number; marksObtained: number; grade: string; examDate: string; createdAt: string }>;
+  studentAudit?: Array<any>;
+  settings: any;
+  teachers?: Array<any>;
+  staff?: Array<any>;
+  guardians?: Array<any>;
+  staffAttendance?: Array<any>;
+  timetable?: Array<any>;
+  admissions?: Array<any>;
+  announcements?: Array<any>;
+  libraryBooks?: Array<any>;
+  libraryLoans?: Array<any>;
+  inventory?: Array<any>;
+  documents?: Array<any>;
+  notifications?: Array<any>;
+  feeStructures?: Array<any>;
+  invoices?: Array<any>;
+  payments?: Array<any>;
+  expenses?: Array<any>;
+  income?: Array<any>;
+  budgets?: Array<any>;
+  payroll?: Array<any>;
+}
+
+const defaultSettings = {
+  schoolName: "Dugsiga Pro 2026",
+  currency: "USD",
+  feeAmount: 50,
+  systemTheme: "light"
+};
+
+function loadLocalDB(): LocalDB {
+  const ensureArrays = (db: any): LocalDB => {
+    if (!db.users) db.users = [];
+    if (!db.passwordRecoveryTokens) db.passwordRecoveryTokens = [];
+    if (!db.students) db.students = [];
+    if (!db.attendance) db.attendance = [];
+    if (!db.fees) db.fees = [];
+    if (!db.classes) db.classes = [];
+    if (!db.subjects) db.subjects = [];
+    if (!db.examScores) db.examScores = [];
+    if (!db.studentAudit) db.studentAudit = [];
+    if (!db.settings) db.settings = defaultSettings;
+    if (!db.teachers) db.teachers = [];
+    if (!db.staff) db.staff = [];
+    if (!db.guardians) db.guardians = [];
+    if (!db.staffAttendance) db.staffAttendance = [];
+    if (!db.timetable) db.timetable = [];
+    if (!db.admissions) db.admissions = [];
+    if (!db.announcements) db.announcements = [];
+    if (!db.libraryBooks) db.libraryBooks = [];
+    if (!db.libraryLoans) db.libraryLoans = [];
+    if (!db.inventory) db.inventory = [];
+    if (!db.documents) db.documents = [];
+    if (!db.notifications) db.notifications = [];
+    if (!db.feeStructures) db.feeStructures = [];
+    if (!db.invoices) db.invoices = [];
+    if (!db.payments) db.payments = [];
+    if (!db.expenses) db.expenses = [];
+    if (!db.income) db.income = [];
+    if (!db.budgets) db.budgets = [];
+    if (!db.payroll) db.payroll = [];
+    return db;
+  };
+
+  // Supabase is the source of truth in cloud mode. Do not read legacy JSON files:
+  // they may contain stale credentials or another tenant's outdated cache.
+  if (customSupabaseActive) {
+    if (inMemoryDB) return ensureArrays(inMemoryDB);
+    const initial = ensureArrays({ settings: defaultSettings });
+    inMemoryDB = initial;
+    return initial;
+  }
+
+  const candidatePaths = [PRIMARY_DB_PATH, TMP_DB_PATH];
+  for (const dbPath of candidatePaths) {
+    try {
+      if (fs.existsSync(dbPath)) {
+        const content = fs.readFileSync(dbPath, "utf-8");
+        const parsed = JSON.parse(content);
+        inMemoryDB = ensureArrays(parsed);
+        return inMemoryDB;
+      }
+    } catch (e) {
+      console.warn(`Failed to read local DB at ${dbPath}:`, e);
+    }
+  }
+
+  if (inMemoryDB) {
+    return ensureArrays(inMemoryDB);
+  }
+
+  const initial = ensureArrays({ settings: defaultSettings });
+  inMemoryDB = initial;
+  saveLocalDB(initial);
+  return initial;
+}
+
+function recordLocalStudentAudit(
+  db: LocalDB,
+  authUser: any,
+  schoolId: string,
+  studentId: string,
+  action: "created" | "updated" | "archived" | "restored" | "deleted",
+  changedFields: string[],
+  beforeData: Record<string, any> | null = null,
+  afterData: Record<string, any> | null = null
+): void {
+  if (!db.studentAudit) db.studentAudit = [];
+  db.studentAudit.push({
+    id: crypto.randomUUID(),
+    schoolId,
+    studentId,
+    action,
+    actorEmail: authUser?.email || "",
+    actorRole: authUser?.role || "",
+    changedFields: Array.from(new Set(changedFields)).slice(0, 50),
+    beforeData,
+    afterData,
+    createdAt: new Date().toISOString()
+  });
+}
+
+function saveLocalDB(data: LocalDB) {
+  inMemoryDB = data;
+
+  // When Supabase is authoritative, this process-local object is only a cache.
+  // Never persist a second production copy of school records to the service filesystem.
+  if (customSupabaseActive) return;
+
+  try {
+    fs.writeFileSync(PRIMARY_DB_PATH, JSON.stringify(data, null, 2));
+    return;
+  } catch {
+    try {
+      fs.writeFileSync(TMP_DB_PATH, JSON.stringify(data, null, 2));
+    } catch (tmpErr) {
+      console.warn("Notice: operating with in-memory DB storage:", tmpErr);
+    }
+  }
+}
+
+function getSchoolId(req: express.Request): string {
+  // ZERO TRUST TENANCY: tenant identity must come only from the verified server session.
+  // Never accept a client-controlled school header or fallback tenant.
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  return authUser?.schoolId?.trim() || "";
+}
+
+function buildAuthResponse(cleanEmail: string, db: any) {
+  // Check if user is a teacher
+  const teacher = (db.teachers || []).find((t: any) => (t.email || "").toLowerCase() === cleanEmail);
+  if (teacher) {
+    if (teacher.status === "DEACTIVATED") {
+      return { error: "Akoonkaaga macallinka waa la hakiyey (Account deactivated). Fadlan la xiriir maamulka iskuulka." };
+    }
+    if (teacher.status === "INVITED") {
+      return { error: "Akoonkan weli lama dhaqaajin. Fadlan isticmaal link-gii casuumaadda ee email-kaaga laguugu soo diray si aad u samaysato password." };
+    }
+    teacher.lastLoginAt = new Date().toISOString();
+    const userPayload: any = {
+      email: cleanEmail,
+      role: "teacher",
+      name: teacher.name,
+      teacherId: teacher.id,
+      schoolId: teacher.schoolId || cleanEmail,
+      assignedClasses: teacher.assignedClasses || [],
+      assignedSubjects: teacher.assignedSubjects || []
+    };
+    const teacherUser = (db.users || []).find((user: any) =>
+      (user.email || "").toLowerCase() === cleanEmail &&
+      String(user.role || "").trim().toLowerCase() === "teacher"
+    );
+    const token = createSessionToken(userPayload, Number(teacherUser?.session_version) || 0);
+    return {
+      success: true,
+      token,
+      user: userPayload
+    };
+  }
+
+  // Otherwise school administrator
+  const userRecord = (db.users || []).find((u: any) => (u.email || "").toLowerCase() === cleanEmail);
+  const userPayload: any = {
+    email: cleanEmail,
+    role: userRecord?.role || "admin",
+    schoolId: userRecord?.school_id || cleanEmail
+  };
+  const token = createSessionToken(userPayload, Number(userRecord?.session_version) || 0);
+  return {
+    success: true,
+    token,
+    user: userPayload
+  };
+}
+
+const supabaseTableCheckErrors: Record<string, { code: string; message: string }> = {};
+
+async function testSupabaseTable(tableName: string, checkColumn?: string): Promise<boolean> {
+  if (!supabaseActiveKey || !supabase) {
+    supabaseTableCheckErrors[tableName] = {
+      code: "CLIENT_NOT_CONFIGURED",
+      message: "Supabase client or key is unavailable"
+    };
+    return false;
+  }
+  try {
+    const selectStr = checkColumn ? checkColumn : "*";
+    const { error } = await supabase.from(tableName).select(selectStr).limit(1);
+    if (error) {
+      supabaseTableCheckErrors[tableName] = {
+        code: String(error.code || "UNKNOWN"),
+        message: String(error.message || "Unknown Supabase Data API error").slice(0, 220)
+      };
+      return false;
+    }
+    delete supabaseTableCheckErrors[tableName];
+    return true;
+  } catch (caught: unknown) {
+    const error = caught as { code?: unknown; message?: unknown };
+    supabaseTableCheckErrors[tableName] = {
+      code: String(error.code || "EXCEPTION"),
+      message: String(error.message || "Supabase Data API request failed").slice(0, 220)
+    };
+    return false;
+  }
+}
+
+let useLocalFallback = true;
+let customSupabaseActive = false;
+
+function handleSupabaseError(res: any, error: any, context: string) {
+  if (error?.message?.includes("fetch failed") || error?.message?.includes("ENOTFOUND")) {
+    useLocalFallback = true;
+    customSupabaseActive = false;
+  }
+  console.warn(`Backend database notice during "${context}":`, error?.message || error);
+  return res.status(500).json({
+    error: error?.message || "Khalad ayaa dhacay inta hawsha lagu jiray. Fadlan dib iskugu day."
+  });
+}
+
+async function checkSupabaseStatus() {
+  if (!supabaseUrl || !supabaseActiveKey || !supabase) {
+    useLocalFallback = true;
+    customSupabaseActive = false;
+    console.log("Supabase not fully configured. Using local database fallback.");
+    return;
+  }
+  try {
+    // 1. Fast connectivity probe with timeout
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+    try {
+      await fetch(supabaseUrl, { signal: controller.signal });
+      clearTimeout(timeout);
+    } catch {
+      clearTimeout(timeout);
+      useLocalFallback = true;
+      customSupabaseActive = false;
+      console.log("Supabase endpoint unreachable. Using local database fallback.");
+      return;
+    }
+
+    const serverKeyCandidates = getSupabaseServerKeyCandidates();
+    const candidateSourcesTried: string[] = [];
+    let tableChecks: Record<string, boolean> = {};
+    let failedTableChecks: string[] = [];
+
+    for (const candidate of serverKeyCandidates) {
+      candidateSourcesTried.push(candidate.source);
+      supabaseActiveKey = candidate.value;
+      try {
+        supabase = createClient(supabaseUrl, supabaseActiveKey, {
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false
+          }
+        });
+      } catch {
+        supabase = null;
+      }
+
+      for (const tableName of Object.keys(supabaseTableCheckErrors)) {
+        delete supabaseTableCheckErrors[tableName];
+      }
+
+      const studentsExist = await testSupabaseTable("dugsiga_students", "school_id");
+      const attendanceExists = await testSupabaseTable("dugsiga_attendance", "school_id");
+      const classesExist = await testSupabaseTable("dugsiga_classes", "school_id");
+      const subjectsExist = await testSupabaseTable("dugsiga_subjects", "school_id");
+      const examsExist = await testSupabaseTable("dugsiga_exam_scores", "school_id");
+      const feesExist = await testSupabaseTable("dugsiga_fees", "school_id");
+      const settingsExist = await testSupabaseTable("dugsiga_settings", "school_id");
+      const usersExist = await testSupabaseTable("dugsiga_users", "email");
+
+      tableChecks = {
+        dugsiga_students: studentsExist,
+        dugsiga_attendance: attendanceExists,
+        dugsiga_classes: classesExist,
+        dugsiga_subjects: subjectsExist,
+        dugsiga_exam_scores: examsExist,
+        dugsiga_fees: feesExist,
+        dugsiga_settings: settingsExist,
+        dugsiga_users: usersExist
+      };
+      failedTableChecks = Object.entries(tableChecks)
+        .filter(([, ok]) => !ok)
+        .map(([tableName]) => tableName);
+
+      if (failedTableChecks.length === 0) break;
+    }
+
+    if (failedTableChecks.length > 0) {
+      useLocalFallback = true;
+      customSupabaseActive = false;
+      const failedTableErrors = Object.fromEntries(
+        failedTableChecks.map((tableName) => [
+          tableName,
+          supabaseTableCheckErrors[tableName] || {
+            code: "NO_ERROR_DETAILS",
+            message: "The table check failed without a reported error"
+          }
+        ])
+      );
+      console.error("Supabase Data API checks failed; cloud persistence is disabled.", {
+        failedTableChecks,
+        failedTableErrors,
+        candidateSourcesTried,
+        serverKeyCandidatesConfigured: serverKeyCandidates.length,
+        supabaseUrlConfigured: Boolean(supabaseUrl)
+      });
+      return;
+    }
+
+    // Read-only health probe. Real mutations validate their own write result; health
+    // checks must not create synthetic tenant rows or require write access.
+    const { error: readError } = await supabase
+      .from("dugsiga_settings")
+      .select("school_id")
+      .limit(1);
+
+    if (readError) {
+      useLocalFallback = true;
+      customSupabaseActive = false;
+      console.warn(`Supabase read probe failed (${readError.code}: ${readError.message}). Cloud persistence is unavailable.`);
+      return;
+    }
+
+    useLocalFallback = false;
+    customSupabaseActive = true;
+    console.log("✅ Supabase si buuxda ayuu ugu xiran yahay (Direct Supabase Cloud Mode Active).");
+
+    // File-backed records are never merged into Supabase automatically.
+  } catch (err: any) {
+    useLocalFallback = true;
+    customSupabaseActive = false;
+    console.log("Error checking Supabase, operating in resilient local database mode:", err?.message || err);
+  }
+}
+
+checkSupabaseStatus();
+
+app.use("/api", async (req, res, next) => {
+  const pathName = req.path;
+  const sessionVersionExemptPaths = [
+    "/auth/signup",
+    "/auth/login",
+    "/auth/verify",
+    "/auth/logout",
+    "/auth/password-recovery",
+    "/auth/password-recovery/validate",
+    "/auth/password-reset",
+    "/db/status"
+  ];
+  if (
+    sessionVersionExemptPaths.includes(pathName) ||
+    /^\/teachers\/verify-invitation\/[^/]+$/.test(pathName) ||
+    pathName === "/teachers/activate-account"
+  ) {
+    return next();
+  }
+
+  const session = getSessionInfoFromRequest(req);
+  if (!session) return next();
+
+  if (process.env.NODE_ENV === "production" && useLocalFallback) {
+    return res.status(503).json({
+      error: "Xaqiijinta gelitaanka hadda lama samayn karo. Fadlan mar kale isku day.",
+      code: "DATABASE_UNAVAILABLE"
+    });
+  }
+
+  try {
+    let account: {
+      email: string;
+      school_id: string | null;
+      role: string | null;
+      teacher_id?: string | null;
+      session_version: number;
+    } | null = null;
+    if (!useLocalFallback && supabase) {
+      const { data, error } = await supabase
+        .from("dugsiga_users")
+        .select("email, school_id, role, teacher_id, session_version")
+        .eq("email", session.user.email)
+        .maybeSingle();
+      if (error) throw error;
+      account = data;
+    } else {
+      const localUser = loadLocalDB().users.find(
+        (item) => item.email.trim().toLowerCase() === session.user.email.toLowerCase()
+      );
+      if (localUser) {
+        account = {
+          email: localUser.email,
+          school_id: localUser.school_id || null,
+          role: localUser.role || null,
+          teacher_id: localUser.teacher_id || null,
+          session_version: Number(localUser.session_version) || 0
+        };
+      }
+    }
+
+    const accountSchoolId = account?.school_id || account?.email;
+    if (
+      !account ||
+      account.email.toLowerCase() !== session.user.email.toLowerCase() ||
+      accountSchoolId !== session.user.schoolId ||
+      String(account.role || "admin").trim().toLowerCase() !== session.user.role.trim().toLowerCase() ||
+      Number(account.session_version) !== session.sessionVersion ||
+      (session.user.role.toLowerCase() === "teacher" &&
+        String(account.teacher_id || "") !== String(session.user.teacherId || ""))
+    ) {
+      clearSessionCookie(req, res);
+      return res.status(401).json({
+        error: "Furaha gelitaanku wuu dhacay. Fadlan mar kale gal akoonkaaga."
+      });
+    }
+    return next();
+  } catch {
+    console.error("Authentication session version could not be verified.");
+    return res.status(503).json({
+      error: "Xaqiijinta gelitaanka hadda lama samayn karo. Fadlan mar kale isku day.",
+      code: "DATABASE_UNAVAILABLE"
+    });
+  }
+});
+
+const SQL_SETUP_SCRIPT = `
+-- =========================================================================
+-- DUGSI PRO 2026 — PRODUCTION SAFE NON-DESTRUCTIVE DATABASE SETUP
+-- Safely creates all core and modernized tables without dropping any data
+-- =========================================================================
+
+-- 1. Users Table
+CREATE TABLE IF NOT EXISTS dugsiga_users (
+  id BIGSERIAL UNIQUE,
+  email TEXT PRIMARY KEY,
+  password TEXT NOT NULL,
+  verified BOOLEAN DEFAULT TRUE,
+  role TEXT DEFAULT 'School Admin',
+  school_id TEXT,
+  teacher_id TEXT,
+  verification_code TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Students Table
+CREATE TABLE IF NOT EXISTS dugsiga_students (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  full_name TEXT NOT NULL,
+  class TEXT NOT NULL,
+  gender TEXT NOT NULL DEFAULT 'Male',
+  guardian_phone TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT,
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+  photo TEXT,
+  date_of_birth TEXT,
+  address TEXT,
+  guardian_name TEXT,
+  guardian_relationship TEXT,
+  guardian_phone_alt TEXT,
+  section TEXT,
+  roll_number TEXT,
+  national_id TEXT,
+  emergency_contact TEXT,
+  previous_school TEXT,
+  blood_group TEXT,
+  medical_notes TEXT
+);
+
+-- 3. Classes Table
+CREATE TABLE IF NOT EXISTS dugsiga_classes (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  teacher_name TEXT,
+  room_number TEXT,
+  description TEXT,
+  section TEXT,
+  capacity INTEGER,
+  academic_year TEXT,
+  created_at TEXT
+);
+
+-- 4. Subjects Table
+CREATE TABLE IF NOT EXISTS dugsiga_subjects (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  subject_name TEXT NOT NULL,
+  subject_code TEXT,
+  class_name TEXT,
+  teacher_name TEXT,
+  category TEXT,
+  description TEXT,
+  pass_marks NUMERIC DEFAULT 50,
+  max_marks NUMERIC DEFAULT 100,
+  created_at TEXT
+);
+
+-- 5. Exam Scores Table
+CREATE TABLE IF NOT EXISTS dugsiga_exam_scores (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  student_id TEXT NOT NULL,
+  student_name TEXT,
+  class_name TEXT NOT NULL,
+  subject_name TEXT NOT NULL,
+  exam_name TEXT NOT NULL,
+  term TEXT,
+  max_marks NUMERIC DEFAULT 100,
+  marks_obtained NUMERIC NOT NULL,
+  grade TEXT,
+  exam_date TEXT,
+  created_at TEXT
+);
+
+-- 6. Student Attendance Table
+CREATE TABLE IF NOT EXISTS dugsiga_attendance (
+  school_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  student_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  timestamp TEXT,
+  session_type TEXT DEFAULT 'before_break',
+  PRIMARY KEY (school_id, date, student_id, session_type)
+);
+
+-- 7. Fees Table
+CREATE TABLE IF NOT EXISTS dugsiga_fees (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  student_id TEXT NOT NULL,
+  month TEXT NOT NULL,
+  year INTEGER NOT NULL,
+  amount NUMERIC NOT NULL,
+  paid_amount NUMERIC NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT,
+  updated_at TEXT,
+  history JSONB
+);
+
+-- 8. Settings Table
+CREATE TABLE IF NOT EXISTS dugsiga_settings (
+  school_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value JSONB,
+  PRIMARY KEY (school_id, key)
+);
+
+-- 9. Teachers Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_teachers (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  teacher_id TEXT,
+  name TEXT NOT NULL,
+  photo TEXT,
+  gender TEXT,
+  date_of_birth TEXT,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  qualification TEXT,
+  specialization TEXT,
+  hire_date TEXT,
+  employment_status TEXT DEFAULT 'Full-Time',
+  salary NUMERIC DEFAULT 0,
+  emergency_contact TEXT,
+  notes TEXT,
+  assigned_classes JSONB,
+  assigned_subjects JSONB,
+  created_at TEXT
+);
+
+-- 10. Staff Members Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_staff (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  employee_id TEXT,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,
+  department TEXT,
+  phone TEXT,
+  email TEXT,
+  hire_date TEXT,
+  salary NUMERIC DEFAULT 0,
+  employment_status TEXT DEFAULT 'Full-Time',
+  notes TEXT,
+  created_at TEXT
+);
+
+-- 11. Guardians Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_guardians (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  guardian_id TEXT,
+  name TEXT NOT NULL,
+  relationship TEXT,
+  phone TEXT NOT NULL,
+  whatsapp TEXT,
+  email TEXT,
+  address TEXT,
+  occupation TEXT,
+  emergency_contact TEXT,
+  student_ids JSONB,
+  notes TEXT,
+  created_at TEXT
+);
+
+-- 12. Staff Attendance Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_staff_attendance (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  staff_id TEXT NOT NULL,
+  staff_name TEXT,
+  role TEXT,
+  date TEXT NOT NULL,
+  status TEXT NOT NULL,
+  timestamp TEXT,
+  notes TEXT
+);
+
+-- 13. Timetable Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_timetable (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  academic_year TEXT,
+  term TEXT,
+  class_name TEXT NOT NULL,
+  teacher_name TEXT NOT NULL,
+  subject_name TEXT NOT NULL,
+  room_number TEXT,
+  day TEXT NOT NULL,
+  start_time TEXT NOT NULL,
+  end_time TEXT NOT NULL
+);
+
+-- 14. Admissions Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_admissions (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  applicant_name TEXT NOT NULL,
+  gender TEXT,
+  date_of_birth TEXT,
+  desired_class TEXT NOT NULL,
+  guardian_name TEXT,
+  guardian_phone TEXT,
+  guardian_relationship TEXT,
+  admission_date TEXT,
+  status TEXT DEFAULT 'Pending',
+  notes TEXT,
+  student_id TEXT,
+  created_at TEXT
+);
+
+-- 15. Announcements Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_announcements (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  audience TEXT DEFAULT 'Everyone',
+  target_class TEXT,
+  author TEXT,
+  priority TEXT DEFAULT 'Normal',
+  status TEXT DEFAULT 'Active',
+  publish_date TEXT,
+  expiry_date TEXT,
+  created_at TEXT
+);
+
+-- 16. Library Books Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_library_books (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  isbn TEXT,
+  title TEXT NOT NULL,
+  author TEXT NOT NULL,
+  category TEXT,
+  total_copies INTEGER DEFAULT 1,
+  available_copies INTEGER DEFAULT 1,
+  location TEXT,
+  created_at TEXT
+);
+
+-- 17. Library Loans Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_library_loans (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  book_id TEXT NOT NULL,
+  book_title TEXT,
+  borrower_type TEXT NOT NULL,
+  borrower_id TEXT NOT NULL,
+  borrower_name TEXT NOT NULL,
+  issue_date TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  return_date TEXT,
+  status TEXT DEFAULT 'Borrowed'
+);
+
+-- 18. Inventory Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_inventory (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  item_name TEXT NOT NULL,
+  category TEXT,
+  quantity INTEGER DEFAULT 1,
+  location TEXT,
+  condition TEXT DEFAULT 'Good',
+  purchase_date TEXT,
+  purchase_cost NUMERIC DEFAULT 0,
+  assigned_to TEXT,
+  status TEXT DEFAULT 'Available',
+  notes TEXT
+);
+
+-- 19. Documents Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_documents (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  related_id TEXT,
+  related_name TEXT,
+  file_type TEXT,
+  file_size TEXT,
+  file_url TEXT,
+  upload_date TEXT,
+  notes TEXT
+);
+
+-- 20. Notifications Table (Extension)
+CREATE TABLE IF NOT EXISTS dugsiga_notifications (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  recipient_name TEXT,
+  status TEXT DEFAULT 'Sent',
+  created_at TEXT
+);
+
+-- 20B. Student Audit Log Table
+CREATE TABLE IF NOT EXISTS dugsiga_student_audit (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  school_id TEXT NOT NULL,
+  student_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('created','updated','archived','restored','deleted')),
+  actor_email TEXT,
+  actor_role TEXT,
+  changed_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
+  before_data JSONB,
+  after_data JSONB,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now())
+);
+
+CREATE INDEX IF NOT EXISTS idx_dugsiga_student_audit_school_student
+  ON dugsiga_student_audit (school_id, student_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dugsiga_student_audit_school_action
+  ON dugsiga_student_audit (school_id, action, created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dugsiga_students_school_national_id
+  ON dugsiga_students (school_id, lower(btrim(national_id)))
+  WHERE national_id IS NOT NULL AND btrim(national_id) <> '';
+
+-- Student class/section guardrail
+CREATE OR REPLACE FUNCTION public.dugsiga_validate_student_class_assignment()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $function$
+DECLARE
+  class_count INTEGER;
+  section_rows INTEGER;
+  clean_class TEXT;
+  clean_section TEXT;
+BEGIN
+  clean_class := lower(btrim(coalesce(NEW.class, '')));
+  clean_section := lower(btrim(coalesce(NEW.section, '')));
+
+  IF clean_class = '' THEN
+    RAISE EXCEPTION USING errcode = '23514', message = 'Student class is required.';
+  END IF;
+
+  SELECT count(*)::integer,
+         count(*) FILTER (WHERE btrim(coalesce(c.section, '')) <> '')::integer
+    INTO class_count, section_rows
+  FROM public.dugsiga_classes c
+  WHERE c.school_id = NEW.school_id
+    AND lower(btrim(coalesce(c.class_name, ''))) = clean_class;
+
+  IF class_count = 0 THEN
+    RAISE EXCEPTION USING errcode = '23514',
+      message = format('Student class does not exist: %s.', NEW.class);
+  END IF;
+
+  IF section_rows > 0 THEN
+    IF clean_section = '' THEN
+      RAISE EXCEPTION USING errcode = '23514',
+        message = format('Student section is required for class: %s.', NEW.class);
+    END IF;
+
+    IF NOT EXISTS (
+      SELECT 1 FROM public.dugsiga_classes c
+      WHERE c.school_id = NEW.school_id
+        AND lower(btrim(coalesce(c.class_name, ''))) = clean_class
+        AND lower(btrim(coalesce(c.section, ''))) = clean_section
+    ) THEN
+      RAISE EXCEPTION USING errcode = '23514',
+        message = format('Student section does not exist: %s / %s.', NEW.class, NEW.section);
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS trg_dugsiga_students_class_assignment ON public.dugsiga_students;
+CREATE TRIGGER trg_dugsiga_students_class_assignment
+BEFORE INSERT OR UPDATE OF school_id, class, section ON public.dugsiga_students
+FOR EACH ROW EXECUTE FUNCTION public.dugsiga_validate_student_class_assignment();
+
+-- Append-only student audit
+CREATE OR REPLACE FUNCTION public.dugsiga_student_audit_immutable()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $function$
+BEGIN
+  RAISE EXCEPTION USING errcode = '42501', message = 'Student audit records are append-only.';
+END;
+$function$;
+
+DROP TRIGGER IF EXISTS trg_dugsiga_student_audit_immutable ON public.dugsiga_student_audit;
+CREATE TRIGGER trg_dugsiga_student_audit_immutable
+BEFORE UPDATE OR DELETE ON public.dugsiga_student_audit
+FOR EACH ROW EXECUTE FUNCTION public.dugsiga_student_audit_immutable();
+
+REVOKE EXECUTE ON FUNCTION public.dugsiga_validate_student_class_assignment() FROM public, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.dugsiga_student_audit_immutable() FROM public, anon, authenticated;
+
+-- 21. Fee Structures Table
+CREATE TABLE IF NOT EXISTS dugsiga_fee_structures (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL,
+  amount NUMERIC NOT NULL DEFAULT 0,
+  class_name TEXT DEFAULT 'All Classes',
+  academic_year TEXT DEFAULT '2026-2027',
+  term TEXT DEFAULT 'All Terms',
+  description TEXT,
+  created_at TEXT
+);
+
+-- 22. Invoices Table
+CREATE TABLE IF NOT EXISTS dugsiga_invoices (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  invoice_number TEXT NOT NULL,
+  student_id TEXT NOT NULL,
+  student_name TEXT,
+  class_name TEXT,
+  guardian_name TEXT,
+  guardian_phone TEXT,
+  items JSONB DEFAULT '[]'::jsonb,
+  subtotal NUMERIC NOT NULL DEFAULT 0,
+  discount NUMERIC NOT NULL DEFAULT 0,
+  total NUMERIC NOT NULL DEFAULT 0,
+  paid_amount NUMERIC NOT NULL DEFAULT 0,
+  balance NUMERIC NOT NULL DEFAULT 0,
+  issue_date TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Unpaid',
+  notes TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+-- 23. Payments Table
+CREATE TABLE IF NOT EXISTS dugsiga_payments (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  receipt_number TEXT NOT NULL,
+  invoice_id TEXT,
+  invoice_number TEXT,
+  student_id TEXT,
+  student_name TEXT,
+  class_name TEXT,
+  amount NUMERIC NOT NULL DEFAULT 0,
+  payment_date TEXT NOT NULL,
+  payment_method TEXT NOT NULL DEFAULT 'Cash',
+  reference TEXT,
+  remaining_balance NUMERIC DEFAULT 0,
+  received_by TEXT NOT NULL,
+  notes TEXT,
+  created_at TEXT
+);
+
+-- 24. Expenses Table
+CREATE TABLE IF NOT EXISTS dugsiga_expenses (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  expense_id TEXT,
+  category TEXT NOT NULL,
+  description TEXT NOT NULL,
+  amount NUMERIC NOT NULL DEFAULT 0,
+  date TEXT NOT NULL,
+  payment_method TEXT NOT NULL DEFAULT 'Cash',
+  vendor_payee TEXT NOT NULL,
+  reference_number TEXT,
+  receipt_document TEXT,
+  created_by TEXT NOT NULL,
+  notes TEXT,
+  status TEXT NOT NULL DEFAULT 'Approved',
+  payroll_id TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+-- 25. Income Table
+CREATE TABLE IF NOT EXISTS dugsiga_income (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  income_id TEXT,
+  category TEXT NOT NULL,
+  description TEXT NOT NULL,
+  amount NUMERIC NOT NULL DEFAULT 0,
+  date TEXT NOT NULL,
+  payment_method TEXT NOT NULL DEFAULT 'Cash',
+  reference TEXT,
+  payer TEXT NOT NULL,
+  notes TEXT,
+  created_by TEXT NOT NULL,
+  payment_id TEXT,
+  created_at TEXT
+);
+
+-- 26. Budgets Table
+CREATE TABLE IF NOT EXISTS dugsiga_budgets (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  academic_year TEXT NOT NULL DEFAULT '2026-2027',
+  period TEXT NOT NULL DEFAULT 'Annual',
+  category TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'Expense',
+  planned_amount NUMERIC NOT NULL DEFAULT 0,
+  actual_amount NUMERIC NOT NULL DEFAULT 0,
+  remaining_amount NUMERIC NOT NULL DEFAULT 0,
+  variance NUMERIC NOT NULL DEFAULT 0,
+  notes TEXT,
+  created_at TEXT
+);
+
+-- 27. Payroll Table
+CREATE TABLE IF NOT EXISTS dugsiga_payroll (
+  id TEXT PRIMARY KEY,
+  school_id TEXT NOT NULL,
+  employee_type TEXT NOT NULL DEFAULT 'Teacher',
+  employee_id TEXT NOT NULL,
+  employee_name TEXT NOT NULL,
+  role_or_department TEXT,
+  basic_salary NUMERIC NOT NULL DEFAULT 0,
+  allowances NUMERIC NOT NULL DEFAULT 0,
+  deductions NUMERIC NOT NULL DEFAULT 0,
+  gross_salary NUMERIC NOT NULL DEFAULT 0,
+  net_salary NUMERIC NOT NULL DEFAULT 0,
+  payment_date TEXT NOT NULL,
+  payment_method TEXT NOT NULL DEFAULT 'EVC Plus',
+  payroll_period TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Draft',
+  notes TEXT,
+  paid_at TEXT,
+  expense_id TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+-- Security defaults: keep RLS enabled and expose tables only to server-side service_role
+DO $dugsi$
+DECLARE
+  tbl_name TEXT;
+  tables_list TEXT[] := ARRAY[
+    'dugsiga_users','dugsiga_students','dugsiga_classes','dugsiga_subjects',
+    'dugsiga_exam_scores','dugsiga_attendance','dugsiga_fees','dugsiga_settings',
+    'dugsiga_teachers','dugsiga_staff','dugsiga_guardians','dugsiga_staff_attendance',
+    'dugsiga_timetable','dugsiga_admissions','dugsiga_announcements',
+    'dugsiga_library_books','dugsiga_library_loans','dugsiga_inventory',
+    'dugsiga_documents','dugsiga_notifications','dugsiga_fee_structures',
+    'dugsiga_invoices','dugsiga_payments','dugsiga_expenses','dugsiga_income',
+    'dugsiga_budgets','dugsiga_payroll','dugsiga_student_audit'
+  ];
+BEGIN
+  FOREACH tbl_name IN ARRAY tables_list LOOP
+    EXECUTE format('ALTER TABLE public.%I ENABLE ROW LEVEL SECURITY', tbl_name);
+    EXECUTE format('REVOKE ALL ON TABLE public.%I FROM anon, authenticated', tbl_name);
+    EXECUTE format('GRANT ALL ON TABLE public.%I TO service_role', tbl_name);
+  END LOOP;
+END $dugsi$;
+`;
+
+// RBAC Permissions Mapping
+const ROLE_PERMISSIONS: Record<string, string[]> = {
+  'Super Admin': ['*'],
+  'School Admin': ['*'],
+  'Principal': [
+    'students.*', 'teachers.*', 'staff.*', 'guardians.*',
+    'attendance.*', 'exams.*', 'classes.*', 'subjects.*',
+    'timetable.*', 'admissions.*', 'announcements.*', 'reports.*',
+    'communication.*', 'library.*', 'inventory.*', 'finance.view'
+  ],
+  'Teacher': [
+    'students.view', 'attendance.view', 'attendance.manage',
+    'exams.view', 'exams.manage', 'classes.view', 'subjects.view',
+    'timetable.view', 'reports.view', 'announcements.view'
+  ],
+  'Accountant': [
+    'finance.*', 'students.view', 'reports.view', 'inventory.view', 'announcements.view'
+  ],
+  'Receptionist': [
+    'students.view', 'students.create', 'students.update',
+    'admissions.*', 'attendance.view', 'announcements.view', 'communication.*'
+  ],
+  'Librarian': [
+    'library.*', 'students.view', 'staff.view', 'announcements.view'
+  ],
+  'Staff': [
+    'timetable.view', 'announcements.view', 'attendance.view'
+  ]
+};
+
+function normalizeRole(role: string): string {
+  const normalized = String(role || "").trim().toLowerCase();
+  const aliases: Record<string, string> = {
+    "admin": "School Admin",
+    "school admin": "School Admin",
+    "super admin": "Super Admin",
+    "teacher": "Teacher",
+    "staff": "Staff",
+    "accountant": "Accountant",
+    "receptionist": "Receptionist",
+    "librarian": "Librarian",
+    "principal": "Principal"
+  };
+  return aliases[normalized] || role.trim();
+}
+
+function hasPermission(role: string, requiredPermission: string): boolean {
+  const normalizedRole = normalizeRole(role);
+  const permissions = ROLE_PERMISSIONS[normalizedRole] || [];
+  if (permissions.includes('*')) return true;
+  if (permissions.includes(requiredPermission)) return true;
+  const [domain] = requiredPermission.split('.');
+  if (permissions.includes(`${domain}.*`)) return true;
+  return false;
+}
+
+// Map every protected API surface to a least-privilege permission.
+// This is defense-in-depth on top of the existing tenant filters in each handler.
+function requiredPermissionForRequest(req: express.Request): string | null {
+  const pathName = req.path;
+
+  if (pathName === "/reset") return "system.reset";
+  if (pathName === "/db/status" || pathName === "/supabase-server-test") return "system.admin";
+  if (pathName === "/documentation-pdf" || pathName.startsWith("/docs/download/")) return "reports.view";
+  if (pathName === "/user/profile") return null;
+
+  const read = req.method === "GET";
+  const mutationPermission = (domain: string) => `${domain}.manage`;
+  const readPermission = (domain: string) => `${domain}.view`;
+
+  if (pathName === "/students/bulk" || pathName === "/students/import") return "students.manage";
+  if (/^\/students\/[^/]+\/audit$/.test(pathName)) return "students.manage";
+  if (pathName.startsWith("/students")) return read ? readPermission("students") : (req.method === "POST" ? "students.create" : req.method === "PUT" ? "students.update" : "students.delete");
+  if (pathName.startsWith("/classes")) return read ? readPermission("classes") : mutationPermission("classes");
+  if (pathName.startsWith("/subjects")) return read ? readPermission("subjects") : mutationPermission("subjects");
+  if (pathName.startsWith("/exams")) return read ? readPermission("exams") : "exams.manage";
+  if (pathName.startsWith("/attendance")) return read ? readPermission("attendance") : "attendance.manage";
+  if (pathName.startsWith("/teachers")) return read ? readPermission("teachers") : mutationPermission("teachers");
+  if (pathName.startsWith("/staff-attendance")) return read ? readPermission("attendance") : "attendance.manage";
+  if (pathName.startsWith("/staff")) return read ? readPermission("staff") : mutationPermission("staff");
+  if (pathName.startsWith("/guardians")) return read ? readPermission("guardians") : mutationPermission("guardians");
+  if (pathName.startsWith("/timetable")) return read ? readPermission("timetable") : mutationPermission("timetable");
+  if (pathName.startsWith("/admissions")) return read ? readPermission("admissions") : mutationPermission("admissions");
+  if (pathName.startsWith("/announcements")) return read ? readPermission("announcements") : mutationPermission("announcements");
+  if (pathName.startsWith("/library/")) return read ? readPermission("library") : mutationPermission("library");
+  if (pathName.startsWith("/inventory")) return read ? readPermission("inventory") : mutationPermission("inventory");
+  if (pathName.startsWith("/notifications")) return read ? "announcements.view" : "communication.manage";
+  if (pathName.startsWith("/analytics/") || pathName.startsWith("/reports/")) return "reports.view";
+
+  if (
+    pathName.startsWith("/fee-structures") ||
+    pathName.startsWith("/invoices") ||
+    pathName.startsWith("/payments") ||
+    pathName.startsWith("/expenses") ||
+    pathName.startsWith("/income") ||
+    pathName.startsWith("/payroll") ||
+    pathName.startsWith("/budgets")
+  ) {
+    return read ? "finance.view" : "finance.manage";
+  }
+
+  if (pathName === "/profit-loss" || pathName === "/cash-flow" || pathName === "/finance/stats" || pathName === "/financial-reports") {
+    return "finance.view";
+  }
+
+  return null;
+}
+
+// Password hashing is centralized in server/authSession.ts.
+
+// ✅ EMAIL VERIFICATION LA SAARAY - Auto verified
+async function sendVerificationEmail(toEmail: string, code: string) {
+  console.log(`Auto-verified user: ${toEmail} (no email required)`);
+  return true;
+}
+
+function expressWithSupabase(config: any, handler: any) {
+  let webHandler: any = null;
+  try {
+    webHandler = withSupabase(config, handler);
+  } catch (err) {
+    console.error("expressWithSupabase initialization failed, will retry lazily:", err);
+  }
+  return async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    try {
+      if (!webHandler) {
+        try {
+          webHandler = withSupabase(config, handler);
+        } catch (innerErr: any) {
+          return res.status(500).json({
+            error: "Failed to initialize Supabase server adapter.",
+            message: innerErr?.message || String(innerErr)
+          });
+        }
+      }
+      const protocol = req.secure || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
+      const host = req.get("host") || "localhost:3000";
+      const fullUrl = `${protocol}://${host}${req.originalUrl}`;
+      const headers = new Headers();
+      for (const [key, val] of Object.entries(req.headers)) {
+        if (val) {
+          if (Array.isArray(val)) {
+            val.forEach(v => headers.append(key, v));
+          } else {
+            headers.set(key, val);
+          }
+        }
+      }
+      if (process.env.SUPABASE_PUBLISHABLE_KEY) {
+        if (!headers.has("apikey")) {
+          headers.set("apikey", process.env.SUPABASE_PUBLISHABLE_KEY);
+        }
+        if (!headers.has("authorization") && req.headers.authorization) {
+          headers.set("authorization", req.headers.authorization);
+        } else if (!headers.has("authorization")) {
+          headers.set("authorization", `Bearer ${process.env.SUPABASE_PUBLISHABLE_KEY}`);
+        }
+      }
+      let body: string | undefined;
+      if (["POST", "PUT", "PATCH", "DELETE"].includes(req.method) && req.body) {
+        body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+      }
+      const webRequest = new Request(fullUrl, {
+        method: req.method,
+        headers,
+        body,
+        duplex: body ? "half" : undefined
+      } as any);
+      const webResponse = await webHandler(webRequest);
+      res.status(webResponse.status);
+      webResponse.headers.forEach((value, key) => {
+        res.setHeader(key, value);
+      });
+      const responseText = await webResponse.text();
+      res.send(responseText);
+    } catch (error) {
+      console.error("expressWithSupabase Adapter Error:", error);
+      next(error);
+    }
+  };
+}
+
+
+/* ============================================================================
+   STUDENTS MODULE - PRODUCTION VALIDATION / AUDIT HELPERS
+   ============================================================================ */
+const STUDENT_ALLOWED_STATUSES = new Set(["active", "inactive", "archived"]);
+const STUDENT_ALLOWED_GENDERS = new Set(["Male", "Female"]);
+const STUDENT_MAX_BULK = 200;
+
+function cleanStudentString(value: unknown, field: string, maxLength: number, required = false): { ok: boolean; value: string; error?: string } {
+  if (value === undefined || value === null) {
+    if (required) return { ok: false, value: "", error: `${field} waa qasab.` };
+    return { ok: true, value: "" };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, value: "", error: `${field} waa inuu noqdaa qoraal sax ah.` };
+  }
+  const normalized = value.trim();
+  if (required && !normalized) {
+    return { ok: false, value: "", error: `${field} waa qasab.` };
+  }
+  if (normalized.length > maxLength) {
+    return { ok: false, value: "", error: `${field} kama badnaan karo ${maxLength} xaraf.` };
+  }
+  return { ok: true, value: normalized };
+}
+
+function isValidDateOnly(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day;
+}
+
+function isValidStudentPhone(value: string): boolean {
+  return !value || /^[+0-9()\s.-]{7,30}$/.test(value);
+}
+
+function isSafeStudentId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{1,79}$/.test(value);
+}
+
+function escapeIlikePattern(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+const ATTENDANCE_ALLOWED_STATUSES = new Set(["Present", "Absent", "Late", "Excused"]);
+const ATTENDANCE_ALLOWED_SESSIONS = new Set(["before_break", "after_break"]);
+const ATTENDANCE_MAX_RECORDS = 1000;
+
+function validateAttendanceDate(value: unknown): string | null {
+  if (typeof value !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(value)) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  if (value > new Date().toISOString().slice(0, 10)) return null;
+  return value;
+}
+
+function normalizeAttendanceSession(value: unknown): "before_break" | "after_break" | null {
+  const session = typeof value === "string" ? value.trim() : "";
+  return ATTENDANCE_ALLOWED_SESSIONS.has(session)
+    ? (session as "before_break" | "after_break")
+    : null;
+}
+
+function normalizeAttendanceStatus(value: unknown): "Present" | "Absent" | "Late" | "Excused" | null {
+  const status = typeof value === "string" ? value.trim() : "";
+  return ATTENDANCE_ALLOWED_STATUSES.has(status)
+    ? (status as "Present" | "Absent" | "Late" | "Excused")
+    : null;
+}
+
+async function getAttendanceAllowedStudents(
+  schoolId: string,
+  authUser: any,
+  studentIds: string[]
+): Promise<{ rows: any[]; error?: string }> {
+  if (!supabase) return { rows: [], error: "Database lama diyaarin." };
+
+  let query = supabase
+    .from("dugsiga_students")
+    .select("id,class,status")
+    .eq("school_id", schoolId)
+    .in("id", studentIds);
+
+  if (authUser?.role === "teacher") {
+    const assignedClasses = Array.isArray(authUser.assignedClasses)
+      ? authUser.assignedClasses.map((item: unknown) => String(item).trim()).filter(Boolean)
+      : [];
+
+    if (assignedClasses.length === 0) {
+      return { rows: [], error: "Macallinkan fasallo looma xilsaarin." };
+    }
+
+    query = query.in("class", assignedClasses);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+
+  return { rows: data || [] };
+}
+
+
+function validateStudentPayload(
+  payload: any,
+  options: { partial?: boolean; allowId?: boolean; allowCreatedAt?: boolean } = {}
+): { ok: boolean; value: Record<string, any>; error?: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, value: {}, error: "Xogta ardayga ma saxna." };
+  }
+
+  const partial = options.partial === true;
+  const value: Record<string, any> = {};
+
+  const hasValue = (key: string) =>
+    Object.prototype.hasOwnProperty.call(payload, key) &&
+    payload[key] !== undefined &&
+    payload[key] !== null;
+
+  const readString = (key: string, label: string, max: number, required = false) => {
+    const present = hasValue(key);
+    if (partial && !present) return true;
+    const result = cleanStudentString(payload[key], label, max, required);
+    if (!result.ok) {
+      value.__error = result.error;
+      return false;
+    }
+    value[key] = result.value;
+    return true;
+  };
+
+  if (!readString("fullName", "Magaca ardayga", 160, !partial)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("class", "Fasalka", 120, !partial)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("guardianPhone", "Telefoonka waalidka", 30, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("guardianName", "Magaca waalidka", 160, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("guardianRelationship", "Xiriirka waalidka", 60, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("guardianPhoneAlt", "Telefoonka labaad", 30, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("emergencyContact", "Emergency Contact", 60, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("section", "Section", 50, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("rollNumber", "Roll Number", 50, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("nationalId", "National ID", 80, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("previousSchool", "School-kii hore", 160, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("bloodGroup", "Blood Group", 20, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("address", "Cinwaanka", 500, false)) return { ok: false, value: {}, error: value.__error };
+  if (!readString("medicalNotes", "Medical Notes", 2000, false)) return { ok: false, value: {}, error: value.__error };
+
+  if (!partial || hasValue("gender")) {
+    const gender = typeof payload.gender === "string" && payload.gender.trim() ? payload.gender.trim() : partial ? "" : "Male";
+    if (!gender && partial) return { ok: false, value: {}, error: "Jinsiga ma saxna." };
+    if (gender && !STUDENT_ALLOWED_GENDERS.has(gender)) return { ok: false, value: {}, error: "Jinsiga ardayga ma saxna." };
+    if (gender) value.gender = gender;
+  }
+
+  if (!partial || hasValue("status")) {
+    const status = typeof payload.status === "string" && payload.status.trim() ? payload.status.trim().toLowerCase() : partial ? "" : "active";
+    if (!status && partial) return { ok: false, value: {}, error: "Xaaladda ardayga ma saxna." };
+    if (status && !STUDENT_ALLOWED_STATUSES.has(status)) return { ok: false, value: {}, error: "Xaaladda ardayga ma saxna." };
+    if (status) value.status = status;
+  }
+
+  if (!partial || Object.prototype.hasOwnProperty.call(payload, "guardianPhone")) {
+    if (!isValidStudentPhone(value.guardianPhone ?? "")) return { ok: false, value: {}, error: "Telefoonka waalidka ma saxna." };
+  }
+
+  if (!partial || Object.prototype.hasOwnProperty.call(payload, "guardianPhoneAlt")) {
+    if (!isValidStudentPhone(value.guardianPhoneAlt ?? "")) return { ok: false, value: {}, error: "Telefoonka labaad ma saxna." };
+  }
+
+  if (!partial || hasValue("emergencyContact")) {
+    const emergencyContact = value.emergencyContact ?? "";
+    if (emergencyContact && !/^[+0-9()\s.-]{7,60}$/.test(emergencyContact)) {
+      return { ok: false, value: {}, error: "Emergency Contact ma saxna." };
+    }
+  }
+
+  if (!partial || hasValue("dateOfBirth")) {
+    const dob = value.dateOfBirth ?? (typeof payload.dateOfBirth === "string" ? payload.dateOfBirth.trim() : "");
+    if (dob) {
+      if (!isValidDateOnly(dob)) return { ok: false, value: {}, error: "Taariikhda dhalashada ma saxna. Isticmaal YYYY-MM-DD." };
+      if (dob > new Date().toISOString().slice(0, 10)) return { ok: false, value: {}, error: "Taariikhda dhalashada mustaqbal ma noqon karto." };
+    }
+    value.dateOfBirth = dob;
+  }
+
+  if (!partial || (options.allowCreatedAt && hasValue("createdAt"))) {
+    const createdAt = typeof payload.createdAt === "string" ? payload.createdAt.trim() : "";
+    if (createdAt && !isValidDateOnly(createdAt)) return { ok: false, value: {}, error: "Taariikhda diiwaangelinta ma saxna. Isticmaal YYYY-MM-DD." };
+    if (createdAt && createdAt > new Date().toISOString().slice(0, 10)) return { ok: false, value: {}, error: "Taariikhda diiwaangelintu mustaqbal ma noqon karto." };
+    if (createdAt) value.createdAt = createdAt;
+  }
+
+  if (!partial && options.allowId !== false && Object.prototype.hasOwnProperty.call(payload, "id")) {
+    const id = typeof payload.id === "string" ? payload.id.trim() : "";
+    if (id && !isSafeStudentId(id)) return { ok: false, value: {}, error: "Student ID-ga ma saxna." };
+    if (id) value.id = id;
+  }
+
+  if (!partial || hasValue("photo")) {
+    const photo = typeof payload.photo === "string" ? payload.photo.trim() : "";
+    if (photo.length > 1_500_000) return { ok: false, value: {}, error: "Sawirka ardayga aad buu u weyn yahay." };
+    value.photo = photo;
+  }
+
+  if (!partial && !value.createdAt) value.createdAt = new Date().toISOString().slice(0, 10);
+  if (!partial && value.status === undefined) value.status = "active";
+  if (!partial && value.gender === undefined) value.gender = "Male";
+  if (!partial && value.guardianPhone === undefined) value.guardianPhone = "";
+
+  delete value.__error;
+  return { ok: true, value };
+}
+
+function canViewSensitiveStudentData(authUser: ReturnType<typeof getAuthenticatedUser>): boolean {
+  if (!authUser) return false;
+  const normalized = normalizeRole(authUser.role);
+  return normalized === 'Super Admin' ||
+    normalized === 'School Admin' ||
+    normalized === 'Principal' ||
+    normalized === 'Receptionist';
+}
+
+function formatStudentRow(
+  s: any,
+  authUser: ReturnType<typeof getAuthenticatedUser> = null
+): any {
+  const canViewSensitive = canViewSensitiveStudentData(authUser);
+
+  return {
+    id: s.id,
+    fullName: s.full_name,
+    class: s.class,
+    gender: s.gender,
+    guardianPhone: s.guardian_phone || "",
+    status: s.status || "active",
+    createdAt: s.created_at || "",
+    updatedAt: s.updated_at || s.created_at || "",
+    photo: s.photo || "",
+    dateOfBirth: s.date_of_birth || "",
+    address: s.address || "",
+    guardianName: s.guardian_name || "",
+    guardianRelationship: s.guardian_relationship || "",
+    guardianPhoneAlt: s.guardian_phone_alt || "",
+    emergencyContact: s.emergency_contact || "",
+    section: s.section || "",
+    rollNumber: s.roll_number || "",
+    nationalId: canViewSensitive ? (s.national_id || "") : "",
+    previousSchool: s.previous_school || "",
+    bloodGroup: canViewSensitive ? (s.blood_group || "") : "",
+    medicalNotes: canViewSensitive ? (s.medical_notes || "") : ""
+  };
+}
+
+function formatStudentDuplicateMatch(s: any): Record<string, string> {
+  return {
+    id: String(s.id || ""),
+    fullName: String(s.full_name || s.fullName || ""),
+    class: String(s.class || ""),
+    section: String(s.section || ""),
+    rollNumber: String(s.roll_number || s.rollNumber || "")
+  };
+}
+
+async function assertStudentClassCapacity(
+  schoolId: string,
+  className: string,
+  additionalStudents: number,
+  excludeStudentIds: string[] = [],
+  sectionName = ''
+): Promise<{ ok: boolean; error?: string }> {
+  const cleanClass = className.trim();
+  const cleanSection = sectionName.trim();
+  if (!cleanClass || additionalStudents <= 0) return { ok: true };
+
+  if (!useLocalFallback) {
+    const { data: classRows, error: classError } = await supabase
+      .from("dugsiga_classes")
+      .select("id,class_name,section,capacity")
+      .eq("school_id", schoolId)
+      .eq("class_name", cleanClass)
+      .limit(50);
+
+    if (classError) throw classError;
+
+    const classRow =
+      (classRows || []).find((row: any) =>
+        cleanSection &&
+        String(row.section || '').trim().toLowerCase() === cleanSection.toLowerCase()
+      ) ||
+      (classRows || []).find((row: any) => !String(row.section || '').trim()) ||
+      (classRows || [])[0];
+
+    const capacity = Number(classRow?.capacity);
+    if (!classRow || !Number.isFinite(capacity) || capacity <= 0) return { ok: true };
+
+    const classRowSection = String(classRow.section || '').trim();
+    let query = supabase
+      .from("dugsiga_students")
+      .select("id", { count: "exact", head: true })
+      .eq("school_id", schoolId)
+      .eq("class", cleanClass)
+      .neq("status", "archived");
+
+    if (classRowSection) query = query.eq("section", classRowSection);
+
+    if (excludeStudentIds.length > 0) {
+      const safeIds = excludeStudentIds.filter((id) => /^[A-Za-z0-9][A-Za-z0-9._-]{1,79}$/.test(id));
+      if (safeIds.length > 0) {
+        query = query.not("id", "in", `(${safeIds.join(',')})`);
+      }
+    }
+
+    const { count, error } = await query;
+    if (error) throw error;
+
+    const currentActive = Number(count || 0);
+    if (currentActive + additionalStudents > capacity) {
+      const scope = classRowSection ? cleanClass + ' / ' + classRowSection : cleanClass;
+      return { ok: false, error: `Fasalka ${scope} wuxuu buuxsamay. Capacity-ga waa ${capacity}, hadda waxaa ku jira ${currentActive} arday firfircoon.` };
+    }
+    return { ok: true };
+  }
+
+  const db = loadLocalDB();
+  const classRows = (db.classes || []).filter(
+    (item: any) => item.schoolId === schoolId && String(item.className || '').trim() === cleanClass
+  );
+  const classRow =
+    classRows.find((item: any) =>
+      cleanSection && String(item.section || '').trim().toLowerCase() === cleanSection.toLowerCase()
+    ) ||
+    classRows.find((item: any) => !String(item.section || '').trim()) ||
+    classRows[0];
+
+  const capacity = Number(classRow?.capacity);
+  if (!classRow || !Number.isFinite(capacity) || capacity <= 0) return { ok: true };
+
+  const classRowSection = String(classRow.section || '').trim();
+  const excluded = new Set(excludeStudentIds);
+  const currentActive = (db.students || []).filter((student: any) => {
+    if (student.schoolId !== schoolId) return false;
+    if (String(student.class || '').trim() !== cleanClass) return false;
+    if (String(student.status || 'active').toLowerCase() === 'archived') return false;
+    if (excluded.has(student.id)) return false;
+    if (classRowSection) {
+      return String(student.section || '').trim().toLowerCase() === classRowSection.toLowerCase();
+    }
+    return true;
+  }).length;
+
+  if (currentActive + additionalStudents > capacity) {
+    const scope = classRowSection ? cleanClass + ' / ' + classRowSection : cleanClass;
+    return { ok: false, error: `Fasalka ${scope} wuxuu buuxsamay. Capacity-ga waa ${capacity}, hadda waxaa ku jira ${currentActive} arday firfircoon.` };
+  }
+  return { ok: true };
+}
+async function studentClassExists(
+  schoolId: string,
+  className: string,
+  sectionName = ''
+): Promise<boolean> {
+  const cleanClass = className.trim();
+  const cleanSection = sectionName.trim();
+  if (!cleanClass) return false;
+
+  if (!useLocalFallback) {
+    const { data, error } = await supabase
+      .from("dugsiga_classes")
+      .select("id,class_name,section")
+      .eq("school_id", schoolId)
+      .ilike("class_name", escapeIlikePattern(cleanClass))
+      .limit(100);
+
+    if (error) throw error;
+    const rows = data || [];
+    if (rows.length === 0) return false;
+
+    const hasSectionRows = rows.some((row: any) => String(row.section || '').trim() !== '');
+    if (!cleanSection) {
+      return !hasSectionRows;
+    }
+    if (!hasSectionRows) return true;
+
+    return rows.some(
+      (row: any) =>
+        String(row.section || '').trim().toLowerCase() === cleanSection.toLowerCase()
+    );
+  }
+
+  const rows = (loadLocalDB().classes || []).filter(
+    (item: any) =>
+      item.schoolId === schoolId &&
+      String(item.className || '').trim() === cleanClass
+  );
+  if (rows.length === 0) return false;
+
+  const hasSectionRows = rows.some((row: any) => String(row.section || '').trim() !== '');
+  if (!cleanSection) {
+    return !hasSectionRows;
+  }
+  if (!hasSectionRows) return true;
+
+  return rows.some(
+    (row: any) =>
+      String(row.section || '').trim().toLowerCase() === cleanSection.toLowerCase()
+  );
+}
+
+async function findStudentUniquenessConflict(
+  schoolId: string,
+  candidate: Record<string, any>,
+  excludeId?: string
+): Promise<string | null> {
+  if (!supabase) return null;
+
+  if (candidate.id) {
+    let query = supabase.from("dugsiga_students").select("id").eq("id", candidate.id).limit(1);
+    if (excludeId) query = query.neq("id", excludeId);
+    const { data, error } = await query;
+    if (error) throw error;
+    if ((data || []).length > 0) return "Student ID-gan horey ayaa loo isticmaalay.";
+  }
+
+  if (candidate.nationalId) {
+    let query = supabase
+      .from("dugsiga_students")
+      .select("id")
+      .eq("school_id", schoolId)
+      .ilike("national_id", escapeIlikePattern(candidate.nationalId))
+      .limit(1);
+    if (excludeId) query = query.neq("id", excludeId);
+    const { data, error } = await query;
+    if (error) throw error;
+    if ((data || []).length > 0) return "National ID-gan hore ayaa loogu isticmaalay arday kale.";
+  }
+
+  if (candidate.rollNumber && candidate.class) {
+    let query = supabase
+      .from("dugsiga_students")
+      .select("id")
+      .eq("school_id", schoolId)
+      .eq("class", candidate.class)
+      .eq("section", candidate.section || "")
+      .ilike("roll_number", escapeIlikePattern(candidate.rollNumber))
+      .limit(1);
+    if (excludeId) query = query.neq("id", excludeId);
+    const { data, error } = await query;
+    if (error) throw error;
+    if ((data || []).length > 0) return "Roll Number-kan hore ayaa loogu isticmaalay arday kale.";
+  }
+
+  return null;
+}
+
+function buildStudentAuditSnapshot(data: Record<string, any> | null): Record<string, any> | null {
+  if (!data) return null;
+
+  return {
+    id: data.id,
+    school_id: data.school_id,
+    full_name: data.full_name,
+    class: data.class,
+    gender: data.gender,
+    status: data.status,
+    section: data.section || "",
+    roll_number: data.roll_number || "",
+    guardian_name: data.guardian_name || "",
+    guardian_relationship: data.guardian_relationship || "",
+    previous_school: data.previous_school || "",
+    created_at: data.created_at || null,
+    updated_at: data.updated_at || null
+  };
+}
+
+async function recordStudentAudit(
+  req: express.Request,
+  schoolId: string,
+  studentId: string,
+  action: "created" | "updated" | "archived" | "restored" | "deleted",
+  changedFields: string[],
+  beforeData: Record<string, any> | null = null,
+  afterData: Record<string, any> | null = null
+): Promise<void> {
+  if (!supabase || useLocalFallback) return;
+  const actor = getAuthenticatedUser(req, loadLocalDB);
+  try {
+    const { error } = await supabase.from("dugsiga_student_audit").insert([{
+      school_id: schoolId,
+      student_id: studentId,
+      action,
+      actor_email: actor?.email || null,
+      actor_role: actor?.role || null,
+      changed_fields: { fields: Array.from(new Set(changedFields)).slice(0, 50) },
+      before_data: buildStudentAuditSnapshot(beforeData),
+      after_data: buildStudentAuditSnapshot(afterData)
+    }]);
+    if (error) console.warn("Student audit log failed:", error.message);
+  } catch (error: any) {
+    console.warn("Student audit log failed:", error?.message || error);
+  }
+}
+
+function handleStudentSupabaseError(
+  res: express.Response,
+  error: any,
+  operation: string
+) {
+  const code = String(error?.code || '');
+  const message = String(error?.message || '');
+
+  if (code === '23514') {
+    if (message.toLowerCase().includes('capacity')) {
+      return res.status(409).json({
+        error: 'Fasalka aad dooratay wuxuu gaaray capacity-giisa. Fadlan dooro fasal/section kale ama Archive ka dhig arday kale.',
+        code: 'CLASS_CAPACITY_EXCEEDED'
+      });
+    }
+
+    return res.status(409).json({
+      error: 'Xogta fasalka ama section-ka ardayga ma waafaqsana diiwaanka school-ka.',
+      code: 'STUDENT_CLASS_ASSIGNMENT_INVALID'
+    });
+  }
+
+  if (code === '23505') {
+    return res.status(409).json({
+      error: 'Xog arday oo isku mid ah ayaa jirta. Hubi Student ID, Roll Number, ama National ID.',
+      code: 'STUDENT_DUPLICATE'
+    });
+  }
+
+  console.error(`Student module database error during "${operation}":`, {
+    code,
+    message
+  });
+  return res.status(500).json({
+    error: 'Khalad server/database ah ayaa dhacay. Fadlan mar kale isku day.',
+    code: 'STUDENT_DATABASE_ERROR'
+  });
+}
+
+async function getStudentDependencyIds(studentIds: string[], schoolId: string): Promise<Set<string>> {
+  const dependentTables = [
+    ["dugsiga_attendance", "student_id"],
+    ["dugsiga_fees", "student_id"],
+    ["dugsiga_exam_scores", "student_id"],
+    ["dugsiga_invoices", "student_id"],
+    ["dugsiga_payments", "student_id"],
+    ["dugsiga_library_loans", "borrower_id"],
+    ["dugsiga_admissions", "student_id"]
+  ] as const;
+
+  const dependentIds = new Set<string>();
+  if (!supabase || studentIds.length === 0) return dependentIds;
+
+  const results = await Promise.all(
+    dependentTables.map(async ([table, column]) => {
+      const { data, error } = await supabase
+        .from(table)
+        .select(column)
+        .eq("school_id", schoolId)
+        .in(column, studentIds);
+      if (error) throw error;
+      return (data || []).map((row: any) => String(row[column] || ""));
+    })
+  );
+
+  for (const ids of results) for (const id of ids) if (id) dependentIds.add(id);
+  return dependentIds;
+}
+
+/* ==============================================
+   API ROUTES
+   ============================================== */
+
+const PUBLIC_API_PATHS = [
+  /^\/auth\/signup$/,
+  /^\/auth\/login$/,
+  /^\/auth\/verify$/,
+  /^\/auth\/password-recovery$/,
+  /^\/auth\/password-recovery\/validate$/,
+  /^\/auth\/password-reset$/,
+  /^\/teachers\/verify-invitation\/[^/]+$/,
+  /^\/teachers\/activate-account$/
+];
+
+app.use("/api", (req, res, next) => {
+  const publicPath = PUBLIC_API_PATHS.some((pattern) => pattern.test(req.path));
+  if (publicPath) {
+    return next();
+  }
+  return requireAuthenticatedRequest(req, res, next);
+});
+
+app.use("/api", (req, res, next) => {
+  const publicPath = PUBLIC_API_PATHS.some((pattern) => pattern.test(req.path));
+  if (publicPath) return next();
+
+  const requiredPermission = requiredPermissionForRequest(req);
+  if (!requiredPermission) return next();
+
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!authUser) {
+    return res.status(401).json({
+      error: "Unauthorized. Fadlan marka hore gal akoonkaaga."
+    });
+  }
+
+  if (!hasPermission(authUser.role, requiredPermission)) {
+    return res.status(403).json({
+      error: "Fasax ku filan ma lihid hawshan (Forbidden)."
+    });
+  }
+
+  return next();
+});
+
+app.use("/api", (req, res, next) => {
+  const publicPath = PUBLIC_API_PATHS.some((pattern) => pattern.test(req.path));
+  if (publicPath || !req.path.startsWith("/students")) return next();
+
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!authUser) return next();
+
+  const ip = req.ip || "unknown";
+  const routeKey =
+    req.path === "/students/import"
+      ? "import"
+      : req.path === "/students/bulk"
+      ? "bulk"
+      : req.method === "GET"
+      ? "read"
+      : "mutation";
+
+  const limit =
+    routeKey === "import"
+      ? consumeAuthRateLimit(
+          `students:${authUser.email}:${ip}:import`,
+          5,
+          10 * 60 * 1000
+        )
+      : routeKey === "bulk"
+      ? consumeAuthRateLimit(
+          `students:${authUser.email}:${ip}:bulk`,
+          20,
+          10 * 60 * 1000
+        )
+      : routeKey === "read"
+      ? consumeAuthRateLimit(
+          `students:${authUser.email}:${ip}:read`,
+          120,
+          60 * 1000
+        )
+      : consumeAuthRateLimit(
+          `students:${authUser.email}:${ip}:mutation`,
+          60,
+          60 * 1000
+        );
+
+  if (!limit.allowed) {
+    res.setHeader("Retry-After", String(limit.retryAfterSeconds));
+    return res.status(429).json({
+      error:
+        routeKey === "import"
+          ? "Student imports aad bay u badan yihiin. Fadlan sug wax yar."
+          : "Codsiyada Students aad bay u badan yihiin. Fadlan sug wax yar kadibna mar kale isku day."
+    });
+  }
+
+  return next();
+});
+
+app.use("/api", (req, res, next) => {
+  // Production must never serve stale file-backed data when Supabase is unavailable.
+  // Only endpoints that do not depend on school data are allowed through.
+  const safeWithoutDatabase =
+    (req.method === "GET" && [
+      "/db/status",
+      "/user/profile",
+      "/docs/download/pdf",
+      "/docs/download/word",
+      "/documentation-pdf"
+    ].includes(req.path)) ||
+    (req.method === "POST" && req.path === "/auth/logout");
+
+  if (
+    process.env.NODE_ENV === "production" &&
+    useLocalFallback &&
+    !safeWithoutDatabase
+  ) {
+    return res.status(503).json({
+      error: "Kaydka xogta daruurta ah hadda lama heli karo. Quantora ma isticmaali doono xog maxalli ah oo duug ah. Fadlan dib u tijaabi marka xiriirka Supabase la saxo.",
+      code: "DATABASE_UNAVAILABLE"
+    });
+  }
+
+  return next();
+});
+
+app.get("/api/db/status", async (req, res) => {
+  try {
+    await checkSupabaseStatus();
+    res.json({
+      connected: !useLocalFallback && customSupabaseActive,
+      fallbackMode: useLocalFallback,
+      customSupabaseActive: customSupabaseActive
+    });
+  } catch (err: any) {
+    console.error("Error in /api/db/status:", err);
+    res.status(500).json({
+      connected: false,
+      fallbackMode: true,
+      customSupabaseActive: false,
+      customSupabaseConfigured: false,
+      supabaseUrl: "",
+      error: err.message
+    });
+  }
+});
+
+app.get("/api/docs/download/pdf", (req, res) => {
+  const filePath = path.join(process.cwd(), "DUGSI_PRO_2026_FULL_DOCUMENTATION.pdf");
+  if (fs.existsSync(filePath)) {
+    res.setHeader("Content-Disposition", 'attachment; filename="DUGSI_PRO_2026_FULL_DOCUMENTATION.pdf"');
+    res.setHeader("Content-Type", "application/pdf");
+    return res.sendFile(filePath);
+  }
+  return res.status(404).json({ error: "PDF documentation not found" });
+});
+
+app.get("/api/docs/download/word", (req, res) => {
+  const filePath = path.join(process.cwd(), "DUGSI_PRO_2026_FULL_DOCUMENTATION.doc");
+  if (fs.existsSync(filePath)) {
+    res.setHeader("Content-Disposition", 'attachment; filename="DUGSI_PRO_2026_FULL_DOCUMENTATION.doc"');
+    res.setHeader("Content-Type", "application/msword");
+    return res.sendFile(filePath);
+  }
+  return res.status(404).json({ error: "Word documentation not found" });
+});
+
+app.get("/api/supabase-server-test", expressWithSupabase({ auth: "none" }, async (_req: any, ctx: any) => {
+  try {
+    const { error: usersError } = await ctx.supabaseAdmin.from("dugsiga_users").select("email").limit(1);
+    const { error: studentsError } = await ctx.supabaseAdmin.from("dugsiga_students").select("id").limit(1);
+    return Response.json({
+      status: "success",
+      message: "Supabase server SDK successfully configured!",
+      has_supabase_client: !!ctx.supabase,
+      has_supabase_admin_client: !!ctx.supabaseAdmin,
+      database_check: !usersError && !studentsError
+    });
+  } catch (err: any) {
+    return Response.json({ status: "error", message: err.message }, { status: 500 });
+  }
+}));
+
+function getCanonicalAppUrl(): string {
+  const configuredUrl = sanitizeEnvValue(process.env.APP_URL);
+  if (!configuredUrl) throw new Error("APP_URL is not configured");
+
+  const appUrl = new URL(configuredUrl);
+  if (
+    !["https:", "http:"].includes(appUrl.protocol) ||
+    appUrl.username ||
+    appUrl.password ||
+    appUrl.search ||
+    appUrl.hash ||
+    (process.env.NODE_ENV === "production" && appUrl.protocol !== "https:")
+  ) {
+    throw new Error("APP_URL is not a valid canonical application URL");
+  }
+  return appUrl.toString().replace(/\/+$/, "");
+}
+
+function isRecoverableRole(role: string): boolean {
+  return ["admin", "school admin", "school_admin", "teacher"].includes(
+    role.trim().toLowerCase()
+  );
+}
+
+function hasDisabledAccountStatus(account: Record<string, any>): boolean {
+  const status = String(account.status || "").trim().toLowerCase();
+  return account.disabled === true ||
+    account.is_active === false ||
+    ["disabled", "deactivated", "inactive", "suspended"].includes(status);
+}
+
+function sameRecoveryAccount(
+  current: PasswordRecoveryAccount | null,
+  expected: PasswordRecoveryAccount
+): boolean {
+  return !!current &&
+    current.email === expected.email &&
+    current.schoolId === expected.schoolId &&
+    current.role === expected.role &&
+    current.teacherId === expected.teacherId;
+}
+
+let recoveryWriteTail: Promise<void> = Promise.resolve();
+
+async function withLocalRecoveryWriteLock<T>(callback: () => Promise<T>): Promise<T> {
+  const previous = recoveryWriteTail;
+  let release!: () => void;
+  recoveryWriteTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await callback();
+  } finally {
+    release();
+  }
+}
+
+function persistLocalRecoveryDB(nextDB: LocalDB): void {
+  const target = fs.existsSync(PRIMARY_DB_PATH) ? PRIMARY_DB_PATH : TMP_DB_PATH;
+  const temporaryPath = `${target}.recovery-${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(nextDB, null, 2), {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    fs.renameSync(temporaryPath, target);
+    inMemoryDB = nextDB;
+  } catch (error) {
+    try {
+      if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+    } catch {
+      console.error("Password recovery could not remove a temporary database file.");
+    }
+    console.error("Password recovery could not persist its database transaction.");
+    throw error;
+  }
+}
+
+function getLocalRecoveryAccount(email: string): PasswordRecoveryAccount | null {
+  const db = loadLocalDB();
+  const user = db.users.find((item) => item.email.trim().toLowerCase() === email);
+  if (!user || user.verified === false || hasDisabledAccountStatus(user)) return null;
+
+  const role = String(user.role || "").trim();
+  const schoolId = String(user.school_id || "").trim();
+  if (!isRecoverableRole(role) || !schoolId) return null;
+
+  const teacherId = role.toLowerCase() === "teacher"
+    ? String(user.teacher_id || "").trim()
+    : null;
+  if (role.toLowerCase() === "teacher") {
+    if (!teacherId) return null;
+    const teacher = (db.teachers || []).find((item: any) =>
+      String(item.id) === teacherId &&
+      String(item.schoolId || "") === schoolId &&
+      String(item.email || "").trim().toLowerCase() === email &&
+      String(item.status || "").trim().toUpperCase() === "ACTIVE"
+    );
+    if (!teacher) return null;
+  }
+
+  return { email, schoolId, role, teacherId };
+}
+
+const passwordRecoveryRepository: PasswordRecoveryRepository = {
+  async findAccount(email) {
+    if (!useLocalFallback && supabase) {
+      const { error: recoveryReadinessError } = await supabase.rpc(
+        "dugsiga_validate_password_recovery",
+        { p_token_hash: crypto.randomBytes(32).toString("hex") }
+      );
+      if (recoveryReadinessError) throw recoveryReadinessError;
+
+      const { data: user, error } = await supabase
+        .from("dugsiga_users")
+        .select("email, school_id, role, teacher_id, verified")
+        .eq("email", email)
+        .maybeSingle();
+      if (error) throw error;
+      if (!user || user.verified === false || hasDisabledAccountStatus(user)) return null;
+
+      const role = String(user.role || "").trim();
+      const schoolId = String(user.school_id || "").trim();
+      if (!isRecoverableRole(role) || !schoolId) return null;
+      const teacherId = role.toLowerCase() === "teacher"
+        ? String(user.teacher_id || "").trim()
+        : null;
+      if (role.toLowerCase() === "teacher") {
+        if (!teacherId) return null;
+        const { data: teacher, error: teacherError } = await supabase
+          .from("dugsiga_teachers")
+          .select("id, school_id, email, status")
+          .eq("id", teacherId)
+          .eq("school_id", schoolId)
+          .eq("email", email)
+          .maybeSingle();
+        if (teacherError) throw teacherError;
+        if (!teacher || String(teacher.status || "").trim().toUpperCase() !== "ACTIVE") {
+          return null;
+        }
+      }
+      return { email, schoolId, role, teacherId };
+    }
+
+    return getLocalRecoveryAccount(email);
+  },
+
+  async createToken(account, tokenHash, expiresAt) {
+    if (!useLocalFallback && supabase) {
+      const { data, error } = await supabase.rpc("dugsiga_create_password_recovery", {
+        p_email: account.email,
+        p_school_id: account.schoolId,
+        p_account_role: account.role,
+        p_teacher_id: account.teacherId,
+        p_token_hash: tokenHash,
+        p_expires_at: expiresAt
+      });
+      if (error) throw error;
+      return data === true;
+    }
+
+    return withLocalRecoveryWriteLock(async () => {
+      if (!sameRecoveryAccount(getLocalRecoveryAccount(account.email), account)) return false;
+      const current = loadLocalDB();
+      const next = JSON.parse(JSON.stringify(current)) as LocalDB;
+      next.passwordRecoveryTokens = next.passwordRecoveryTokens || [];
+      next.passwordRecoveryTokens.push({
+        tokenHash,
+        email: account.email,
+        schoolId: account.schoolId,
+        role: account.role,
+        teacherId: account.teacherId,
+        expiresAt,
+        consumedAt: null
+      });
+      persistLocalRecoveryDB(next);
+      return true;
+    });
+  },
+
+  async isTokenValid(tokenHash) {
+    if (!useLocalFallback && supabase) {
+      const { data, error } = await supabase.rpc("dugsiga_validate_password_recovery", {
+        p_token_hash: tokenHash
+      });
+      if (error) throw error;
+      return data === true;
+    }
+
+    const now = Date.now();
+    const record = (loadLocalDB().passwordRecoveryTokens || []).find((item) =>
+      item.tokenHash === tokenHash &&
+      !item.consumedAt &&
+      new Date(item.expiresAt).getTime() > now
+    );
+    if (!record) return false;
+    return sameRecoveryAccount(
+      getLocalRecoveryAccount(record.email),
+      {
+        email: record.email,
+        schoolId: record.schoolId,
+        role: record.role,
+        teacherId: record.teacherId
+      }
+    );
+  },
+
+  async consumeTokenAndUpdatePassword(tokenHash, passwordHash) {
+    if (!useLocalFallback && supabase) {
+      const { data, error } = await supabase.rpc("dugsiga_consume_password_recovery", {
+        p_token_hash: tokenHash,
+        p_password_hash: passwordHash
+      });
+      if (error) throw error;
+      return data === true;
+    }
+
+    return withLocalRecoveryWriteLock(async () => {
+      const current = loadLocalDB();
+      const next = JSON.parse(JSON.stringify(current)) as LocalDB;
+      const now = Date.now();
+      const record = (next.passwordRecoveryTokens || []).find((item) =>
+        item.tokenHash === tokenHash &&
+        !item.consumedAt &&
+        new Date(item.expiresAt).getTime() > now
+      );
+      if (!record) return false;
+
+      const account: PasswordRecoveryAccount = {
+        email: record.email,
+        schoolId: record.schoolId,
+        role: record.role,
+        teacherId: record.teacherId
+      };
+      if (!sameRecoveryAccount(getLocalRecoveryAccount(account.email), account)) return false;
+
+      const user = next.users.find((item) =>
+        item.email.trim().toLowerCase() === account.email &&
+        item.school_id === account.schoolId &&
+        item.role === account.role &&
+        (item.teacher_id || null) === account.teacherId
+      );
+      if (!user) return false;
+
+      user.password_hash = passwordHash;
+      user.session_version = (Number(user.session_version) || 0) + 1;
+      const consumedAt = new Date(now).toISOString();
+      for (const pending of next.passwordRecoveryTokens || []) {
+        if (
+          pending.email === account.email &&
+          pending.schoolId === account.schoolId &&
+          pending.role === account.role &&
+          pending.teacherId === account.teacherId &&
+          !pending.consumedAt
+        ) {
+          pending.consumedAt = consumedAt;
+        }
+      }
+
+      persistLocalRecoveryDB(next);
+      return true;
+    });
+  },
+
+  async deleteToken(tokenHash) {
+    if (!useLocalFallback && supabase) {
+      const { error } = await supabase.rpc("dugsiga_delete_password_recovery", {
+        p_token_hash: tokenHash
+      });
+      if (error) throw error;
+      return;
+    }
+
+    await withLocalRecoveryWriteLock(async () => {
+      const current = loadLocalDB();
+      const next = JSON.parse(JSON.stringify(current)) as LocalDB;
+      next.passwordRecoveryTokens = (next.passwordRecoveryTokens || []).filter(
+        (item) => item.tokenHash !== tokenHash || !!item.consumedAt
+      );
+      persistLocalRecoveryDB(next);
+    });
+  }
+};
+
+app.post("/api/auth/password-recovery", async (req, res) => {
+  if (process.env.NODE_ENV === "production" && useLocalFallback) {
+    return res.status(503).json({
+      error: "Codsiga dib-u-dejinta hadda lama fulin karo. Fadlan mar kale isku day.",
+      code: "DATABASE_UNAVAILABLE"
+    });
+  }
+
+  let recoveryUrl: string;
+  try {
+    recoveryUrl = getCanonicalAppUrl();
+  } catch {
+    console.error("Password recovery is unavailable because APP_URL is invalid.");
+    return res.status(503).json({
+      error: "Codsiga dib-u-dejinta hadda lama fulin karo. Fadlan mar kale isku day.",
+      code: "RECOVERY_CONFIGURATION_ERROR"
+    });
+  }
+
+  try {
+    const email = typeof req.body?.email === "string" ? req.body.email : "";
+    if (email.length <= 320 && email.includes("@")) {
+      await requestPasswordRecovery(
+        email,
+        recoveryUrl,
+        {
+          repository: passwordRecoveryRepository,
+          sendEmail: sendPasswordRecoveryEmail
+        }
+      );
+    }
+  } catch {
+    console.error("Password recovery request could not be completed.");
+    return res.status(503).json({
+      error: "Codsiga dib-u-dejinta hadda lama fulin karo. Fadlan mar kale isku day.",
+      code: "DATABASE_UNAVAILABLE"
+    });
+  }
+  return res.status(202).json(PASSWORD_RECOVERY_GENERIC_RESPONSE);
+});
+
+app.post("/api/auth/password-recovery/validate", async (req, res) => {
+  const token = typeof req.body?.token === "string" ? req.body.token : "";
+  try {
+    const valid = await validatePasswordRecoveryToken(token, passwordRecoveryRepository);
+    return res.json({
+      valid,
+      ...(!valid && { error: "Link-ga dib-u-dejintu ma shaqaynayo ama wuu dhacay. Codso link cusub." })
+    });
+  } catch {
+    console.error("Password recovery token validation failed.");
+    return res.status(503).json({
+      valid: false,
+      error: "Link-ga dib-u-dejinta hadda lama xaqiijin karo. Fadlan mar kale isku day."
+    });
+  }
+});
+
+app.post("/api/auth/password-reset", async (req, res) => {
+  const token = typeof req.body?.token === "string" ? req.body.token : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const confirmPassword = typeof req.body?.confirmPassword === "string"
+    ? req.body.confirmPassword
+    : "";
+  const passwordValidation = validatePassword(password);
+  if (!passwordValidation.valid) {
+    return res.status(400).json({ error: passwordValidation.error });
+  }
+  if (password !== confirmPassword) {
+    return res.status(400).json({ error: "Labada eray-sireed isma laha. Fadlan mar kale hubi." });
+  }
+
+  try {
+    const passwordHash = await hashPassword(password);
+    const result = await resetPasswordWithRecoveryToken(
+      token,
+      password,
+      confirmPassword,
+      passwordHash,
+      passwordRecoveryRepository
+    );
+    if (!result.success) {
+      return res.status(400).json({ error: result.error });
+    }
+    clearSessionCookie(req, res);
+    return res.json({ success: true, message: "Eraygaaga sirta ah waa la cusboonaysiiyey." });
+  } catch {
+    console.error("Password recovery could not persist the password update.");
+    return res.status(503).json({
+      error: "Erayga sirta ah hadda lama cusboonaysiin karo. Fadlan mar kale isku day."
+    });
+  }
+});
+
+app.post("/api/auth/signup", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password || !email.includes("@")) {
+    return res.status(400).json({ error: "Email sax ah iyo password fadlan geli." });
+  }
+  const cleanEmail = email.trim().toLowerCase();
+  const passwordValidation = validatePassword(password);
+  if (!passwordValidation.valid) {
+    return res.status(400).json({ error: passwordValidation.error });
+  }
+  const passwordHash = await hashPassword(password);
+
+  const db = loadLocalDB();
+  const existingLocalUser = db.users.find(u => u.email.toLowerCase() === cleanEmail);
+  // The local file is authoritative only in the deliberate development/offline mode.
+  if (useLocalFallback && existingLocalUser) {
+    return res.status(400).json({ error: "Email-kan horey ayaa loo diiwaangeliyey. Fadlan 'Sign In' ku gal." });
+  }
+
+  // If Supabase is connected, attempt check & sync to Supabase
+  if (!useLocalFallback && supabase) {
+    try {
+      const { data: existingUser, error: selectErr } = await supabase
+        .from("dugsiga_users")
+        .select("email")
+        .eq("email", cleanEmail)
+        .maybeSingle();
+
+      if (selectErr) {
+        const networkFailure =
+          String(selectErr.message || "").includes("fetch failed") ||
+          String(selectErr.message || "").includes("ENOTFOUND");
+        if (networkFailure) {
+          useLocalFallback = true;
+          customSupabaseActive = false;
+        }
+        if (process.env.NODE_ENV === "production" || !networkFailure) {
+          console.error("Signup duplicate check failed in the authoritative database.", {
+            code: String(selectErr.code || "UNKNOWN")
+          });
+          return res.status(503).json({
+            error: "Diiwaangelinta lama xaqiijin karin sababtoo ah kaydka xogta daruurta ah lama heli karo.",
+            code: "DATABASE_UNAVAILABLE"
+          });
+        }
+      } else if (existingUser) {
+        return res.status(400).json({ error: "Email-kan horey ayaa loo diiwaangeliyey. Fadlan 'Sign In' ku gal." });
+      }
+
+      if (!useLocalFallback) {
+        const { error: insertError } = await supabase.from("dugsiga_users").insert([{
+          email: cleanEmail, password: passwordHash, verified: true, role: "admin", school_id: cleanEmail
+        }]);
+
+        if (insertError) {
+          if (insertError.code === "23505") {
+            return res.status(400).json({ error: "Email-kan horey ayaa loo diiwaangeliyey. Fadlan 'Sign In' ku gal." });
+          }
+          const networkFailure =
+            String(insertError.message || "").includes("fetch failed") ||
+            String(insertError.message || "").includes("ENOTFOUND");
+
+          if (networkFailure) {
+            useLocalFallback = true;
+            customSupabaseActive = false;
+          }
+
+          // Never report successful registration if the authoritative cloud write failed.
+          // Development can still use the deliberate local fallback for network outages.
+          if (process.env.NODE_ENV === "production" || !networkFailure) {
+            console.error("Signup rejected because the authoritative database write failed.", {
+              code: String(insertError.code || "UNKNOWN")
+            });
+            return res.status(503).json({
+              error: "Akoonka lama diiwaangelin sababtoo ah kaydka xogta daruurta ah lama heli karo. Fadlan mar kale isku day.",
+              code: "DATABASE_UNAVAILABLE"
+            });
+          }
+        }
+      }
+    } catch (sbErr: any) {
+      const networkFailure =
+        String(sbErr?.message || "").includes("fetch failed") ||
+        String(sbErr?.message || "").includes("ENOTFOUND");
+
+      if (networkFailure) {
+        useLocalFallback = true;
+        customSupabaseActive = false;
+      }
+
+      if (process.env.NODE_ENV === "production" || !networkFailure) {
+        console.error("Signup rejected because the authoritative database write threw an error.");
+        return res.status(503).json({
+          error: "Akoonka lama diiwaangelin sababtoo ah kaydka xogta daruurta ah lama heli karo. Fadlan mar kale isku day.",
+          code: "DATABASE_UNAVAILABLE"
+        });
+      }
+    }
+  }
+
+  // Do not persist a second production copy of credentials in database.json.
+  if (useLocalFallback && !db.users.some(u => u.email.toLowerCase() === cleanEmail)) {
+    db.users.push({
+      email: cleanEmail,
+      password_hash: passwordHash,
+      verified: true,
+      role: "admin",
+      school_id: cleanEmail
+    });
+    saveLocalDB(db);
+  }
+
+  res.json({
+    success: true,
+    message: "Diiwaangelintu way guuleysatay! Hadda geli kartaa.",
+    emailSent: false,
+    user: { email: cleanEmail }
+  });
+});
+
+app.post("/api/auth/verify", async (req, res) => {
+  res.json({ success: true, message: "Verification step is disabled. Automated success." });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = getSessionTokenFromRequest(req);
+  if (token) revokeSession(token);
+  clearSessionCookie(req, res);
+  return res.json({ success: true });
+});
+
+app.get("/api/documentation-pdf", (req, res) => {
+  const publicPdf = path.join(process.cwd(), "public", "DUGSI_PRO_2026_DOCUMENTATION.pdf");
+  const rootPdf = path.join(process.cwd(), "DUGSI_PRO_2026_DOCUMENTATION.pdf");
+  const target = fs.existsSync(publicPdf) ? publicPdf : fs.existsSync(rootPdf) ? rootPdf : null;
+  if (target) {
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'attachment; filename="DUGSI_PRO_2026_DOCUMENTATION.pdf"');
+    return res.sendFile(target);
+  }
+  res.status(404).json({ error: "Documentation PDF lama helin." });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Fadlan geli email iyo password." });
+  const cleanEmail = email.trim().toLowerCase();
+  const db = loadLocalDB();
+  const localUser = db.users.find(u => u.email.toLowerCase() === cleanEmail);
+
+  // 1. Supabase is the only authentication source when cloud mode is active.
+  if (!useLocalFallback && supabase) {
+    try {
+      const { data: user, error } = await supabase
+        .from("dugsiga_users")
+        .select("*")
+        .eq("email", cleanEmail)
+        .maybeSingle();
+
+      if (error) {
+        const networkFailure =
+          String(error.message || "").includes("fetch failed") ||
+          String(error.message || "").includes("ENOTFOUND");
+
+        if (networkFailure) {
+          useLocalFallback = true;
+          customSupabaseActive = false;
+        }
+
+        // Do not authenticate against a stale local password while cloud mode is authoritative.
+        if (process.env.NODE_ENV === "production" || !networkFailure) {
+          return res.status(503).json({
+            error: "Xaqiijinta akoonka lama samayn karo hadda sababtoo ah kaydka xogta daruurta ah lama heli karo.",
+            code: "DATABASE_UNAVAILABLE"
+          });
+        }
+      } else if (!user) {
+        // A cloud account that has been deleted/disabled must not be resurrected from a stale local cache.
+        return res.status(400).json({ error: "Email ama password ayaa qalad ah." });
+      } else {
+        const cloudCheck = await verifyPassword(
+          password,
+          typeof user.password === "string" ? user.password : ""
+        );
+
+        // The local cache is never a second password authority when Supabase is healthy.
+        if (!cloudCheck.valid) {
+          return res.status(400).json({ error: "Email ama password ayaa qalad ah." });
+        }
+
+        let canonicalHash = String(user.password || "");
+        if (cloudCheck.needsRehash) {
+          const upgradedHash = await hashPassword(password);
+          const { error: rehashError } = await supabase
+            .from("dugsiga_users")
+            .update({ password: upgradedHash })
+            .eq("email", cleanEmail)
+            .eq("school_id", user.school_id || cleanEmail);
+
+          if (rehashError) {
+            return res.status(503).json({
+              error: "Password-ka waa la xaqiijiyey, laakiin cusboonaysiinta amniga lama kaydin karin. Fadlan mar kale isku day.",
+              code: "DATABASE_UNAVAILABLE"
+            });
+          }
+          canonicalHash = upgradedHash;
+        }
+
+        // Supabase is authoritative in cloud mode. Do not cache password hashes in database.json.
+
+        if (String(user.role || "").trim().toLowerCase() === "teacher" && user.teacher_id) {
+          const { data: cloudTeacher, error: teacherLookupError } = await supabase
+            .from("dugsiga_teachers")
+            .select("id, school_id, name, email, status, assigned_classes, assigned_subjects")
+            .eq("id", user.teacher_id)
+            .eq("school_id", user.school_id || cleanEmail)
+            .maybeSingle();
+
+          if (teacherLookupError) {
+            console.warn("Teacher status lookup error:", teacherLookupError.message);
+            return res.status(503).json({
+              error: "Akoonka macallinka lama xaqiijin karin hadda. Fadlan mar kale isku day.",
+              code: "DATABASE_UNAVAILABLE"
+            });
+          }
+          if (!cloudTeacher) {
+            return res.status(403).json({ error: "Akoonka macallinka lama helin ama waa la saaray." });
+          }
+          if (["DEACTIVATED", "INACTIVE"].includes(String(cloudTeacher.status || "").toUpperCase())) {
+            return res.status(403).json({ error: "Akoonkaaga macallinka waa la hakiyey (Account deactivated). Fadlan la xiriir maamulka iskuulka." });
+          }
+          if (String(cloudTeacher.status || "").toUpperCase() === "INVITED") {
+            return res.status(403).json({ error: "Akoonkan weli lama dhaqaajin. Fadlan isticmaal link-gii casuumaadda." });
+          }
+
+          const teacherPayload: any = {
+            email: cleanEmail,
+            role: "teacher",
+            name: cloudTeacher.name,
+            teacherId: cloudTeacher.id,
+            schoolId: cloudTeacher.school_id || user.school_id || cleanEmail,
+            assignedClasses: Array.isArray(cloudTeacher.assigned_classes) ? cloudTeacher.assigned_classes : [],
+            assignedSubjects: Array.isArray(cloudTeacher.assigned_subjects) ? cloudTeacher.assigned_subjects : []
+          };
+          const token = createSessionToken(
+            teacherPayload,
+            Number(user.session_version) || 0
+          );
+          if (!isCapacitorClient(req)) setSessionCookie(req, res, token);
+          clearAuthRateLimit(`login:ip:${req.ip || "unknown"}:`);
+          clearAuthRateLimit(`login:account:${req.ip || "unknown"}:${cleanEmail}`);
+          return res.json(
+            isCapacitorClient(req)
+              ? { success: true, user: teacherPayload, token }
+              : { success: true, user: teacherPayload }
+          );
+        }
+
+        const authPayload: any = {
+          email: cleanEmail,
+          role: user.role || "admin",
+          schoolId: user.school_id || cleanEmail
+        };
+        const token = createSessionToken(
+          authPayload,
+          Number(user.session_version) || 0
+        );
+        if (!isCapacitorClient(req)) setSessionCookie(req, res, token);
+        clearAuthRateLimit(`login:ip:${req.ip || "unknown"}:`);
+        clearAuthRateLimit(`login:account:${req.ip || "unknown"}:${cleanEmail}`);
+        return res.json(
+          isCapacitorClient(req)
+            ? { success: true, user: authPayload, token }
+            : { success: true, user: authPayload }
+        );
+      }
+    } catch (e: any) {
+      const networkFailure =
+        String(e?.message || "").includes("fetch failed") ||
+        String(e?.message || "").includes("ENOTFOUND");
+
+      if (networkFailure) {
+        useLocalFallback = true;
+        customSupabaseActive = false;
+      }
+
+      // The production API fails closed during database outages and unexpected auth errors.
+      if (process.env.NODE_ENV === "production" || !networkFailure) {
+        return res.status(503).json({
+          error: "Xaqiijinta akoonka lama samayn karo hadda. Fadlan mar kale isku day.",
+          code: "DATABASE_UNAVAILABLE"
+        });
+      }
+    }
+  }
+
+  // 2. Secure local fallback with transparent legacy-hash upgrade.
+  if (localUser) {
+    const localCheck = await verifyPassword(password, localUser.password_hash);
+    if (!localCheck.valid) {
+      return res.status(400).json({ error: "Email ama password ayaa qalad ah." });
+    }
+
+    if (localCheck.needsRehash) {
+      localUser.password_hash = await hashPassword(password);
+      saveLocalDB(db);
+    }
+
+    const authRes = buildAuthResponse(cleanEmail, db);
+    if (authRes.error) return res.status(403).json({ error: authRes.error });
+    if (!authRes.error && authRes.token) {
+      if (!isCapacitorClient(req)) setSessionCookie(req, res, authRes.token);
+      const { token: _token, ...safeAuthResponse } = authRes;
+      clearAuthRateLimit(`login:ip:${req.ip || "unknown"}:`);
+      clearAuthRateLimit(`login:account:${req.ip || "unknown"}:${cleanEmail}`);
+      return res.json(isCapacitorClient(req) ? authRes : safeAuthResponse);
+    }
+    clearAuthRateLimit(`login:ip:${req.ip || "unknown"}:`);
+    clearAuthRateLimit(`login:account:${req.ip || "unknown"}:${cleanEmail}`);
+    return res.json(authRes);
+  }
+
+  return res.status(400).json({ error: "Email ama password ayaa qalad ah." });
+});
+
+app.get("/api/students", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const isTeacher = authUser.role === "teacher";
+  const teacherClasses = Array.isArray(authUser.assignedClasses)
+    ? authUser.assignedClasses.map((c) => String(c).trim()).filter(Boolean)
+    : [];
+
+  if (!useLocalFallback) {
+    try {
+      const canViewSensitive = canViewSensitiveStudentData(authUser);
+      const studentSelect = canViewSensitive
+        ? "*"
+        : "id,full_name,class,gender,guardian_phone,status,created_at,updated_at,photo,date_of_birth,address,guardian_name,guardian_relationship,guardian_phone_alt,section,roll_number,previous_school";
+
+      let query = supabase
+        .from("dugsiga_students")
+        .select(studentSelect)
+        .eq("school_id", schoolId)
+        .order("full_name", { ascending: true });
+      if (isTeacher) {
+        if (teacherClasses.length === 0) return res.json([]);
+        query = query.in("class", teacherClasses);
+      }
+      const { data, error } = await query;
+      if (error) throw error;
+      return res.json((data || []).map((row: any) => formatStudentRow(row, authUser)));
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Soo qaadista Ardayda (Fetch Students)");
+    }
+  }
+
+  const db = loadLocalDB();
+  let list = (db.students || []).filter((s: any) => s.schoolId === schoolId);
+  if (isTeacher) {
+    if (teacherClasses.length === 0) return res.json([]);
+    list = list.filter((s: any) => teacherClasses.includes(String(s.class || "").trim()));
+  }
+  return res.json(
+    list.map((student: any) => {
+      const base = {
+        id: student.id,
+        fullName: student.fullName,
+        class: student.class,
+        gender: student.gender,
+        guardianPhone: student.guardianPhone || "",
+        status: student.status || "active",
+        createdAt: student.createdAt || "",
+        updatedAt: student.updatedAt || student.createdAt || "",
+        photo: student.photo || "",
+        dateOfBirth: student.dateOfBirth || "",
+        address: student.address || "",
+        guardianName: student.guardianName || "",
+        guardianRelationship: student.guardianRelationship || "",
+        guardianPhoneAlt: student.guardianPhoneAlt || "",
+        emergencyContact: student.emergencyContact || "",
+        section: student.section || "",
+        rollNumber: student.rollNumber || "",
+        nationalId: canViewSensitiveStudentData(authUser) ? (student.nationalId || "") : "",
+        previousSchool: student.previousSchool || "",
+        bloodGroup: canViewSensitiveStudentData(authUser) ? (student.bloodGroup || "") : "",
+        medicalNotes: canViewSensitiveStudentData(authUser) ? (student.medicalNotes || "") : ""
+      };
+      return base;
+    })
+  );
+});
+
+app.get("/api/students/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+  if (!isSafeStudentId(id)) return res.status(400).json({ error: "Student ID-ga ma saxna." });
+
+  const isTeacher = authUser.role === "teacher";
+  const teacherClasses = Array.isArray(authUser.assignedClasses)
+    ? authUser.assignedClasses.map((c) => String(c).trim()).filter(Boolean)
+    : [];
+
+  if (!useLocalFallback) {
+    try {
+      const { data, error } = await supabase
+        .from("dugsiga_students")
+        .select("*")
+        .eq("school_id", schoolId)
+        .eq("id", id)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) return res.status(404).json({ error: "Ardayga lama helin." });
+
+      if (isTeacher) {
+        if (!teacherClasses.includes(String(data.class || "").trim())) {
+          return res.status(403).json({ error: "Ardaygan fasax uma lihid inaad aragto." });
+        }
+      }
+
+      return res.json(formatStudentRow(data, authUser));
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Soo qaadista xogta ardayga");
+    }
+  }
+
+  const db = loadLocalDB();
+  const found = (db.students || []).find((s: any) => s.id === id && s.schoolId === schoolId);
+  if (!found) return res.status(404).json({ error: "Ardayga lama helin." });
+
+  if (isTeacher) {
+    if (!teacherClasses.includes(String(found.class || "").trim())) {
+      return res.status(403).json({ error: "Ardaygan fasax uma lihid inaad aragto." });
+    }
+  }
+
+  const base = {
+    id: found.id,
+    fullName: found.fullName,
+    class: found.class,
+    gender: found.gender,
+    guardianPhone: found.guardianPhone || "",
+    status: found.status || "active",
+    createdAt: found.createdAt || "",
+    updatedAt: found.updatedAt || found.createdAt || "",
+    photo: found.photo || "",
+    dateOfBirth: found.dateOfBirth || "",
+    address: found.address || "",
+    guardianName: found.guardianName || "",
+    guardianRelationship: found.guardianRelationship || "",
+    guardianPhoneAlt: found.guardianPhoneAlt || "",
+    emergencyContact: found.emergencyContact || "",
+    section: found.section || "",
+    rollNumber: found.rollNumber || "",
+    nationalId: canViewSensitiveStudentData(authUser) ? (found.nationalId || "") : "",
+    previousSchool: found.previousSchool || "",
+    bloodGroup: canViewSensitiveStudentData(authUser) ? (found.bloodGroup || "") : "",
+    medicalNotes: canViewSensitiveStudentData(authUser) ? (found.medicalNotes || "") : ""
+  };
+
+  return res.json(base);
+});
+
+app.post("/api/students/check-duplicate", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!schoolId) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const raw = req.body || {};
+  const candidate = validateStudentPayload({
+    fullName: raw.fullName,
+    class: raw.className,
+    section: raw.section,
+    guardianPhone: raw.guardianPhone,
+    rollNumber: raw.rollNumber,
+    nationalId: raw.nationalId,
+    gender: raw.gender
+  }, { partial: true });
+
+  if (!candidate.ok) return res.status(400).json({ error: candidate.error });
+
+  try {
+    const conflicts: any[] = [];
+    const excludeId = typeof raw.excludeId === "string" ? raw.excludeId.trim() : undefined;
+
+    if (!useLocalFallback) {
+      const checks = [
+        raw.studentId
+          ? supabase.from("dugsiga_students").select("id,full_name,class,section,roll_number").eq("school_id", schoolId).eq("id", String(raw.studentId).trim()).limit(1)
+          : Promise.resolve({ data: [], error: null }),
+        candidate.value.fullName && candidate.value.class
+          ? supabase.from("dugsiga_students").select("id,full_name,class,guardian_phone").eq("school_id", schoolId).eq("class", candidate.value.class).ilike("full_name", candidate.value.fullName).limit(5)
+          : Promise.resolve({ data: [], error: null }),
+        candidate.value.rollNumber && candidate.value.class
+          ? supabase
+              .from("dugsiga_students")
+              .select("id,full_name,class,section,roll_number")
+              .eq("school_id", schoolId)
+              .eq("class", candidate.value.class)
+              .eq("section", candidate.value.section || "")
+              .ilike("roll_number", escapeIlikePattern(candidate.value.rollNumber))
+              .limit(5)
+          : Promise.resolve({ data: [], error: null }),
+        candidate.value.nationalId
+          ? supabase.from("dugsiga_students").select("id,full_name,class,guardian_phone,national_id").eq("school_id", schoolId).ilike("national_id", escapeIlikePattern(candidate.value.nationalId)).limit(5)
+          : Promise.resolve({ data: [], error: null })
+      ];
+
+      const results = await Promise.all(checks);
+      for (const result of results) {
+        if (result.error) throw result.error;
+        for (const row of result.data || []) {
+          if (!excludeId || row.id !== excludeId) conflicts.push(row);
+        }
+      }
+    } else {
+      const students = (loadLocalDB().students || []).filter((s: any) => s.schoolId === schoolId);
+      for (const s of students) {
+        if (excludeId && s.id === excludeId) continue;
+        const sameId = raw.studentId && String(s.id).toLowerCase() === String(raw.studentId).trim().toLowerCase();
+        const sameNameClass = candidate.value.fullName && candidate.value.class &&
+          String(s.fullName || "").trim().toLowerCase() === candidate.value.fullName.toLowerCase() &&
+          String(s.class || "").trim() === candidate.value.class;
+        const sameRoll = candidate.value.rollNumber && String(s.rollNumber || "").trim().toLowerCase() === candidate.value.rollNumber.toLowerCase();
+        const sameNational = candidate.value.nationalId && String(s.nationalId || "").trim().toLowerCase() === candidate.value.nationalId.toLowerCase();
+        if (sameId || sameNameClass || sameRoll || sameNational) conflicts.push(s);
+      }
+    }
+
+    const unique = Array.from(new Map(conflicts.map((row) => [row.id, row])).values()).slice(0, 10);
+    const safeDuplicates = unique.map(formatStudentDuplicateMatch);
+    const hasDuplicate = safeDuplicates.length > 0;
+    return res.json({
+      hasDuplicate,
+      duplicate: hasDuplicate,
+      reason: hasDuplicate ? "Xog arday oo isku mid ah ayaa horey u jiray." : undefined,
+      existingStudent: hasDuplicate ? safeDuplicates[0] : undefined,
+      duplicates: safeDuplicates
+    });
+  } catch (e: any) {
+    return handleSupabaseError(res, e, "Hubinta duplicate-ka ardayga");
+  }
+});
+
+
+app.post("/api/students/import", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const incoming = Array.isArray(req.body?.students) ? req.body.students : [];
+  if (incoming.length === 0) return res.status(400).json({ error: "students waa qasab." });
+  if (incoming.length > 500) return res.status(400).json({ error: "Hal import kama badnaan karo 500 arday." });
+
+  try {
+    const normalizedRows: Array<{ row: number; student: Record<string, any> }> = [];
+    const errors: Array<{ row: number; error: string }> = [];
+
+    for (let index = 0; index < incoming.length; index += 1) {
+      const validation = validateStudentPayload(incoming[index], {
+        partial: false,
+        allowId: true,
+        allowCreatedAt: true
+      });
+
+      if (!validation.ok) {
+        errors.push({ row: index + 1, error: validation.error || "Xogta ardayga ma saxna." });
+        continue;
+      }
+
+      if (validation.value.fullName.split(/\s+/).filter(Boolean).length < 2) {
+        errors.push({ row: index + 1, error: "Magaca ardayga waa inuu leeyahay ugu yaraan 2 magac." });
+        continue;
+      }
+
+      normalizedRows.push({ row: index + 1, student: validation.value });
+    }
+
+    if (normalizedRows.length === 0) {
+      return res.status(400).json({
+        error: "Import-ka waxaa ku jira xog aan sax ahayn.",
+        imported: 0,
+        importedCount: 0,
+        failed: errors.length,
+        skippedCount: errors.length,
+        errors: errors.slice(0, 100)
+      });
+    }
+
+    const allClasses = new Set<string>();
+    const classSections = new Map<string, Set<string>>();
+    const currentIds = new Set<string>();
+    const currentRolls = new Set<string>();
+    const currentNationalIds = new Set<string>();
+    const currentNameClasses = new Set<string>();
+
+    if (!useLocalFallback) {
+      const [{ data: classesData, error: classesError }, { data: existingData, error: existingError }] = await Promise.all([
+        supabase.from("dugsiga_classes").select("class_name,section").eq("school_id", schoolId).limit(5000),
+        supabase.from("dugsiga_students").select("id,full_name,class,section,roll_number,national_id").eq("school_id", schoolId).limit(50000)
+      ]);
+
+      if (classesError) throw classesError;
+      if (existingError) throw existingError;
+
+      for (const row of classesData || []) {
+        const name = String(row.class_name || "").trim().toLowerCase();
+        const section = String(row.section || "").trim().toLowerCase();
+
+        if (name) {
+          allClasses.add(name);
+          if (!classSections.has(name)) classSections.set(name, new Set<string>());
+          if (section) classSections.get(name)!.add(section);
+        }
+      }
+
+      for (const row of existingData || []) {
+        if (row.id) currentIds.add(String(row.id).trim().toLowerCase());
+        const roll = String(row.roll_number || "").trim().toLowerCase();
+        const national = String(row.national_id || "").trim().toLowerCase();
+        const name = String(row.full_name || "").trim().toLowerCase();
+        const cls = String(row.class || "").trim().toLowerCase();
+        const section = String(row.section || "").trim().toLowerCase();
+
+        if (roll) currentRolls.add(cls + "::" + section + "::" + roll);
+        if (national) currentNationalIds.add(national);
+        if (name && cls) currentNameClasses.add(name + "::" + cls);
+      }
+    } else {
+      const db = loadLocalDB();
+      for (const row of db.classes || []) {
+        if (row.schoolId === schoolId) {
+          const name = String(row.className || "").trim().toLowerCase();
+          const section = String(row.section || "").trim().toLowerCase();
+          if (name) {
+            allClasses.add(name);
+            if (!classSections.has(name)) classSections.set(name, new Set<string>());
+            if (section) classSections.get(name)!.add(section);
+          }
+        }
+      }
+      for (const row of db.students || []) {
+        if (row.schoolId !== schoolId) continue;
+        if (row.id) currentIds.add(String(row.id).trim().toLowerCase());
+        const roll = String(row.rollNumber || "").trim().toLowerCase();
+        const national = String(row.nationalId || "").trim().toLowerCase();
+        const name = String(row.fullName || "").trim().toLowerCase();
+        const cls = String(row.class || "").trim().toLowerCase();
+        const section = String(row.section || "").trim().toLowerCase();
+
+        if (roll) currentRolls.add(cls + "::" + section + "::" + roll);
+        if (national) currentNationalIds.add(national);
+        if (name && cls) currentNameClasses.add(name + "::" + cls);
+      }
+    }
+
+    const batchIds = new Set<string>();
+    const batchRolls = new Set<string>();
+    const batchNationalIds = new Set<string>();
+    const batchNameClasses = new Set<string>();
+    const batchClassCounts = new Map<string, number>();
+    const insertRows: any[] = [];
+
+    for (const item of normalizedRows) {
+      const student = item.student;
+      const classKey = String(student.class || "").trim().toLowerCase();
+      const rollKey = String(student.rollNumber || "").trim().toLowerCase();
+      const nationalKey = String(student.nationalId || "").trim().toLowerCase();
+      const sectionKey = String(student.section || "").trim().toLowerCase();
+      const scopedRollKey = classKey + "::" + sectionKey + "::" + rollKey;
+      const nameKey = String(student.fullName || "").trim().toLowerCase() + "::" + classKey;
+      const studentId = String(student.id || "").trim() || "STD-" + crypto.randomUUID().slice(0, 8).toUpperCase();
+      const idKey = studentId.toLowerCase();
+
+      if (!allClasses.has(classKey)) {
+        errors.push({ row: item.row, error: "Fasalka la doortay kama jiro school-kan." });
+        continue;
+      }
+
+      const availableClassSections = classSections.get(classKey) || new Set<string>();
+      if (
+        (availableClassSections.size > 0 && !sectionKey) ||
+        (availableClassSections.size > 0 && sectionKey && !availableClassSections.has(sectionKey))
+      ) {
+        errors.push({
+          row: item.row,
+          error: sectionKey
+            ? "Section-ka la doortay kama jiro fasalkan."
+            : "Fasalkani wuxuu leeyahay Section-yo; fadlan Section dooro."
+        });
+        continue;
+      }
+
+      const capacityKey = classKey + '::' + sectionKey;
+      batchClassCounts.set(capacityKey, (batchClassCounts.get(capacityKey) || 0) + 1);
+
+      if (currentIds.has(idKey) || batchIds.has(idKey)) {
+        errors.push({ row: item.row, error: "Student ID-ga hore ayaa loo isticmaalay." });
+        continue;
+      }
+      if (rollKey && (currentRolls.has(scopedRollKey) || batchRolls.has(scopedRollKey))) {
+        errors.push({ row: item.row, error: "Roll Number-kan hore ayaa loo isticmaalay fasalkan iyo section-kan." });
+        continue;
+      }
+      if (nationalKey && (currentNationalIds.has(nationalKey) || batchNationalIds.has(nationalKey))) {
+        errors.push({ row: item.row, error: "National ID-gan hore ayaa loo isticmaalay." });
+        continue;
+      }
+      if (batchNameClasses.has(nameKey) || currentNameClasses.has(nameKey)) {
+        errors.push({ row: item.row, error: "Magacan iyo fasalkan arday hore ayaa loogu diiwaangeliyey." });
+        continue;
+      }
+
+      const nowIso = new Date().toISOString();
+      insertRows.push({
+        id: studentId,
+        school_id: schoolId,
+        full_name: student.fullName,
+        class: student.class,
+        gender: student.gender || "Male",
+        guardian_phone: student.guardianPhone || "",
+        status: student.status || "active",
+        photo: student.photo || "",
+        date_of_birth: student.dateOfBirth || "",
+        address: student.address || "",
+        guardian_name: student.guardianName || "",
+        guardian_relationship: student.guardianRelationship || "",
+        guardian_phone_alt: student.guardianPhoneAlt || "",
+        emergency_contact: student.emergencyContact || "",
+        section: student.section || "",
+        roll_number: student.rollNumber || "",
+        national_id: student.nationalId || "",
+        previous_school: student.previousSchool || "",
+        blood_group: student.bloodGroup || "",
+        medical_notes: student.medicalNotes || "",
+        created_at: student.createdAt || new Date().toISOString().slice(0, 10),
+        updated_at: nowIso
+      });
+
+      batchIds.add(idKey);
+      if (rollKey) batchRolls.add(scopedRollKey);
+      if (nationalKey) batchNationalIds.add(nationalKey);
+      batchNameClasses.add(nameKey);
+    }
+
+    if (errors.length === 0 && batchClassCounts.size > 0) {
+      for (const [capacityKey, additional] of batchClassCounts.entries()) {
+        const separator = capacityKey.indexOf('::');
+        const classKey = separator >= 0 ? capacityKey.slice(0, separator) : capacityKey;
+        const sectionKey = separator >= 0 ? capacityKey.slice(separator + 2) : '';
+        const match = normalizedRows.find((item) =>
+          String(item.student.class || '').trim().toLowerCase() === classKey &&
+          String(item.student.section || '').trim().toLowerCase() === sectionKey
+        );
+        const className = match?.student.class;
+        if (!className) continue;
+
+        const capacity = await assertStudentClassCapacity(
+          schoolId,
+          String(className),
+          additional,
+          [],
+          String(match?.student.section || '')
+        );
+        if (!capacity.ok) {
+          errors.push({ row: 1, error: capacity.error || "Class capacity waa buuxsamay." });
+        }
+      }
+    }
+
+    if (!insertRows.length) {
+      return res.status(400).json({
+        error: "Ma jiraan arday sax ah oo la gelin karo.",
+        imported: 0,
+        importedCount: 0,
+        failed: errors.length,
+        skippedCount: errors.length,
+        errors: errors.slice(0, 100)
+      });
+    }
+
+    if (!useLocalFallback) {
+      const { data, error } = await supabase
+        .from("dugsiga_students")
+        .insert(insertRows)
+        .select("*");
+
+      if (error) {
+        if (error.code === "23505") {
+          return res.status(409).json({
+            error: "Import-ku wuxuu la kulmay duplicate Student ID, Roll Number, ama National ID.",
+            imported: 0,
+            importedCount: 0,
+            failed: insertRows.length + errors.length,
+            skippedCount: insertRows.length + errors.length,
+            errors: errors.slice(0, 100)
+          });
+        }
+        throw error;
+      }
+
+      const inserted = data || [];
+      if (inserted.length !== insertRows.length) {
+        return res.status(500).json({ error: "Import-ku ma dhamaystirin dhammaan records-ka." });
+      }
+
+      const auditRows = inserted.map((row: any) => ({
+        school_id: schoolId,
+        student_id: row.id,
+        action: "created",
+        actor_email: authUser.email,
+        actor_role: authUser.role,
+        changed_fields: {
+          fields: [
+            "fullName", "class", "gender", "guardianPhone", "guardianName",
+            "guardianRelationship", "guardianPhoneAlt", "section", "rollNumber",
+            "nationalId", "previousSchool", "bloodGroup", "medicalNotes", "status"
+          ]
+        },
+        after_data: buildStudentAuditSnapshot(row)
+      }));
+
+      if (auditRows.length > 0) {
+        const { error: auditError } = await supabase
+          .from("dugsiga_student_audit")
+          .insert(auditRows);
+        if (auditError) console.warn("Student import audit log failed:", auditError.message);
+      }
+
+      return res.status(201).json({
+        success: true,
+        imported: inserted.length,
+        importedCount: inserted.length,
+        failed: errors.length,
+        skippedCount: errors.length,
+        errors: errors.slice(0, 100),
+        students: inserted.map((row: any) => formatStudentRow(row, authUser))
+      });
+    }
+
+    const db = loadLocalDB();
+    for (const row of insertRows) {
+      const localStudent = {
+        id: row.id,
+        schoolId,
+        fullName: row.full_name,
+        class: row.class,
+        gender: row.gender,
+        guardianPhone: row.guardian_phone,
+        status: row.status,
+        photo: row.photo,
+        dateOfBirth: row.date_of_birth,
+        address: row.address,
+        guardianName: row.guardian_name,
+        guardianRelationship: row.guardian_relationship,
+        guardianPhoneAlt: row.guardian_phone_alt,
+        emergencyContact: row.emergency_contact,
+        section: row.section,
+        rollNumber: row.roll_number,
+        nationalId: row.national_id,
+        previousSchool: row.previous_school,
+        bloodGroup: row.blood_group,
+        medicalNotes: row.medical_notes,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at
+      };
+      db.students.push(localStudent);
+      recordLocalStudentAudit(
+        db,
+        authUser,
+        schoolId,
+        row.id,
+        "created",
+        Object.keys(localStudent).filter((key) => !["schoolId", "createdAt", "updatedAt"].includes(key)),
+        null,
+        localStudent
+      );
+    }
+    saveLocalDB(db);
+    return res.status(201).json({
+      success: true,
+      imported: insertRows.length,
+      importedCount: insertRows.length,
+      failed: errors.length,
+      skippedCount: errors.length,
+      errors: errors.slice(0, 100),
+      students: insertRows.map((row: any) => formatStudentRow(row, authUser))
+    });
+  } catch (e: any) {
+    return handleStudentSupabaseError(res, e, "Bulk Import-ka Ardayda");
+  }
+});
+
+app.post("/api/students/bulk", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const action = typeof req.body?.action === "string" ? req.body.action.trim() : "";
+  const rawIds = Array.isArray(req.body?.studentIds) ? req.body.studentIds : [];
+  const studentIds: string[] = Array.from(new Set(
+    rawIds
+      .filter((id: unknown): id is string => typeof id === "string")
+      .map((id) => id.trim())
+      .filter(Boolean)
+  ));
+
+  if (!studentIds.length) return res.status(400).json({ error: "studentIds waa qasab." });
+  if (studentIds.length > STUDENT_MAX_BULK) return res.status(400).json({ error: `Hal mar kama badnaan karaan ${STUDENT_MAX_BULK} arday.` });
+  if (!["change_status", "change_class", "archive", "restore", "delete"].includes(action)) {
+    return res.status(400).json({ error: "Action-ka bulk-ga ma saxna." });
+  }
+
+  const targetStatus = typeof req.body?.targetStatus === "string" ? req.body.targetStatus.trim().toLowerCase() : "";
+  const targetClass = typeof req.body?.targetClass === "string" ? req.body.targetClass.trim() : "";
+  const targetSection = typeof req.body?.targetSection === "string" ? req.body.targetSection.trim() : "";
+  if ((action === "change_status" && !STUDENT_ALLOWED_STATUSES.has(targetStatus)) || (action === "change_class" && !targetClass)) {
+    return res.status(400).json({ error: "Qiimaha bulk-ga ma saxna." });
+  }
+
+  if (!useLocalFallback) {
+    try {
+      if (
+        action === "change_class" &&
+        !(await studentClassExists(schoolId, targetClass, targetSection))
+      ) {
+        return res.status(400).json({ error: "Fasalka cusub kama jiro school-kan." });
+      }
+
+      const { data: rows, error: rowsError } = await supabase
+        .from("dugsiga_students")
+        .select("*")
+        .eq("school_id", schoolId)
+        .in("id", studentIds);
+      if (rowsError) throw rowsError;
+      const found = rows || [];
+      if (found.length !== studentIds.length) {
+        const foundIds = new Set(found.map((row: any) => row.id));
+        return res.status(404).json({
+          error: "Qaar ka mid ah ardayda lama helin ama school-kan kama tirsana.",
+          missingIds: studentIds.filter((id) => !foundIds.has(id)).slice(0, 20)
+        });
+      }
+
+      if (action === "change_class") {
+        const activeToMove = found.filter(
+          (row: any) => String(row.status || 'active').toLowerCase() !== 'archived'
+        ).length;
+        if (activeToMove > 0) {
+          const capacity = await assertStudentClassCapacity(
+            schoolId,
+            targetClass,
+            activeToMove,
+            studentIds,
+            targetSection
+          );
+          if (!capacity.ok) return res.status(409).json({ error: capacity.error });
+        }
+      }
+
+      if (action === "change_status" && targetStatus === 'active') {
+        const activeToRestore = found.filter(
+          (row: any) => String(row.status || 'active').toLowerCase() !== 'active'
+        );
+
+        const capacityGroups = new Map<string, { className: string; section: string; count: number }>();
+        for (const row of activeToRestore) {
+          const className = String(row.class || '').trim();
+          const section = String(row.section || '').trim();
+          const key = className.toLowerCase() + '::' + section.toLowerCase();
+          const currentGroup = capacityGroups.get(key);
+          if (currentGroup) {
+            currentGroup.count += 1;
+          } else {
+            capacityGroups.set(key, { className, section, count: 1 });
+          }
+        }
+
+        for (const group of capacityGroups.values()) {
+          const capacity = await assertStudentClassCapacity(
+            schoolId,
+            group.className,
+            group.count,
+            activeToRestore.map((row: any) => row.id),
+            group.section
+          );
+          if (!capacity.ok) return res.status(409).json({ error: capacity.error });
+        }
+      }
+
+      if (action === "delete") {
+        const dependentIds = await getStudentDependencyIds(studentIds, schoolId);
+        if (dependentIds.size > 0) {
+          return res.status(409).json({
+            error: "Qaar ka mid ah ardaydan waxay leeyihiin xog ku xiran. Isticmaal Archive halkii Delete.",
+            dependentCount: dependentIds.size
+          });
+        }
+
+        const { data: deleted, error } = await supabase
+          .from("dugsiga_students")
+          .delete()
+          .eq("school_id", schoolId)
+          .in("id", studentIds)
+          .select("*");
+        if (error) throw error;
+
+        const deletedRows = deleted || [];
+        const deletedIds = deletedRows.map((row: any) => row.id);
+        await Promise.all(
+          deletedRows.map((row: any) =>
+            recordStudentAudit(req, schoolId, row.id, "deleted", ["student"], row, null)
+          )
+        );
+        return res.json({ success: true, count: deletedIds.length, processedCount: deletedIds.length });
+      }
+
+      const nextStatus = action === "archive" ? "archived" : action === "restore" ? "active" : action === "change_status" ? targetStatus : undefined;
+      const updateObj: any = { updated_at: new Date().toISOString() };
+      if (action === "change_class") {
+        updateObj.class = targetClass;
+        if (Object.prototype.hasOwnProperty.call(req.body || {}, "targetSection")) {
+          updateObj.section = targetSection;
+        }
+      }
+      if (nextStatus) updateObj.status = nextStatus;
+
+      const { data: updated, error } = await supabase
+        .from("dugsiga_students")
+        .update(updateObj)
+        .eq("school_id", schoolId)
+        .in("id", studentIds)
+        .select("*");
+      if (error) throw error;
+
+      const beforeById = new Map<string, any>(
+        found.map((row: any) => [String(row.id), row])
+      );
+      const updatedRows = updated || [];
+      await Promise.all(
+        updatedRows.map((row: any) =>
+          recordStudentAudit(
+            req,
+            schoolId,
+            row.id,
+            row.status === "archived" ? "archived" : "updated",
+            Object.keys(updateObj).filter((key) => key !== "updated_at"),
+            beforeById.get(String(row.id)) || null,
+            row
+          )
+        )
+      );
+      return res.json({ success: true, count: updatedRows.length, processedCount: updatedRows.length });
+    } catch (e: any) {
+      return handleStudentSupabaseError(res, e, "Hawsha guud ee ardayda (Bulk Students Operation)");
+    }
+  }
+
+  const db = loadLocalDB();
+  const selected = (db.students || []).filter((s: any) => s.schoolId === schoolId && studentIds.includes(s.id));
+  if (selected.length !== studentIds.length) return res.status(404).json({ error: "Qaar ka mid ah ardayda lama helin." });
+
+  if (action === "change_class") {
+    if (!(await studentClassExists(schoolId, targetClass, targetSection))) {
+      return res.status(400).json({ error: "Fasalka cusub kama jiro school-kan." });
+    }
+
+    const activeToMove = selected.filter(
+      (row: any) => String(row.status || "active").toLowerCase() !== "archived"
+    ).length;
+    if (activeToMove > 0) {
+      const capacity = await assertStudentClassCapacity(
+        schoolId,
+        targetClass,
+        activeToMove,
+        studentIds,
+        targetSection
+      );
+      if (!capacity.ok) return res.status(409).json({ error: capacity.error });
+    }
+  }
+
+  if (action === "change_status" && targetStatus === "active") {
+    const restoreCounts = new Map<string, number>();
+    for (const row of selected) {
+      if (String(row.status || "active").toLowerCase() === "active") continue;
+      const classKey = String(row.class || "").trim().toLowerCase();
+      const sectionKey = String(row.section || "").trim().toLowerCase();
+      const key = classKey + "::" + sectionKey;
+      restoreCounts.set(key, (restoreCounts.get(key) || 0) + 1);
+    }
+
+    for (const [key, count] of restoreCounts) {
+      const separator = key.indexOf("::");
+      const classKey = separator >= 0 ? key.slice(0, separator) : key;
+      const sectionKey = separator >= 0 ? key.slice(separator + 2) : "";
+      const representative = selected.find(
+        (row: any) =>
+          String(row.class || "").trim().toLowerCase() === classKey &&
+          String(row.section || "").trim().toLowerCase() === sectionKey
+      );
+      if (!representative) continue;
+
+      const check = await assertStudentClassCapacity(
+        schoolId,
+        String(representative.class || ""),
+        count,
+        studentIds,
+        String(representative.section || "")
+      );
+      if (!check.ok) return res.status(409).json({ error: check.error });
+    }
+  }
+
+  if (action === "delete") {
+    const hasDependencies =
+      (db.fees || []).some((f: any) => studentIds.includes(f.studentId) && f.schoolId === schoolId) ||
+      (db.attendance || []).some((a: any) => studentIds.includes(a.studentId) && a.schoolId === schoolId) ||
+      (db.examScores || []).some((e: any) => studentIds.includes(e.studentId) && e.schoolId === schoolId);
+    if (hasDependencies) return res.status(409).json({ error: "Qaar ka mid ah ardaydan waxay leeyihiin xog ku xiran. Isticmaal Archive." });
+
+    db.students = db.students.filter((s: any) => !(studentIds.includes(s.id) && s.schoolId === schoolId));
+    for (const current of selected) {
+      recordLocalStudentAudit(db, authUser, schoolId, current.id, "deleted", ["student"], current, null);
+    }
+  } else {
+    db.students = db.students.map((s: any) => {
+      if (!studentIds.includes(s.id) || s.schoolId !== schoolId) return s;
+
+      if (action === "change_class") {
+        const updatedStudent = {
+          ...s,
+          class: targetClass,
+          ...(Object.prototype.hasOwnProperty.call(req.body || {}, "targetSection")
+            ? { section: targetSection }
+            : {}),
+          updatedAt: new Date().toISOString()
+        };
+        recordLocalStudentAudit(
+          db,
+          authUser,
+          schoolId,
+          s.id,
+          "updated",
+          ["class", ...(Object.prototype.hasOwnProperty.call(req.body || {}, "targetSection") ? ["section"] : [])],
+          s,
+          updatedStudent
+        );
+        return updatedStudent;
+      }
+
+      const nextStatus = action === "archive" ? "archived" : action === "restore" ? "active" : action === "change_status" ? targetStatus : undefined;
+      const updatedStudent = {
+        ...s,
+        status: nextStatus || s.status,
+        updatedAt: new Date().toISOString()
+      };
+      const oldStatus = String(s.status || "active").toLowerCase();
+      const newStatus = String(updatedStudent.status || oldStatus).toLowerCase();
+      const auditAction =
+        oldStatus !== "archived" && newStatus === "archived"
+          ? "archived"
+          : oldStatus === "archived" && newStatus === "active"
+          ? "restored"
+          : "updated";
+      recordLocalStudentAudit(db, authUser, schoolId, s.id, auditAction, ["status"], s, updatedStudent);
+      return updatedStudent;
+    });
+  }
+
+  saveLocalDB(db);
+  return res.json({ success: true, count: studentIds.length, processedCount: studentIds.length });
+});
+
+app.post("/api/students", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const validation = validateStudentPayload(req.body, { partial: false, allowId: true, allowCreatedAt: true });
+  if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+  const student = validation.value;
+  if (student.fullName.split(/\s+/).filter(Boolean).length < 2) {
+    return res.status(400).json({ error: "Magaca ardayga waa inuu leeyahay ugu yaraan 2 magac." });
+  }
+  const studentId = student.id || `STD-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const createdAt = student.createdAt || new Date().toISOString().slice(0, 10);
+  const nowIso = new Date().toISOString();
+
+  try {
+    if (!useLocalFallback) {
+      if (!(await studentClassExists(schoolId, student.class, student.section || ''))) {
+        return res.status(400).json({ error: "Fasalka la doortay kama jiro school-kan." });
+      }
+
+      const capacity = await assertStudentClassCapacity(schoolId, student.class, 1, [], student.section || '');
+      if (!capacity.ok) return res.status(409).json({ error: capacity.error });
+
+      const conflict = await findStudentUniquenessConflict(schoolId, {
+        ...student,
+        id: studentId,
+        section: student.section || ''
+      });
+      if (conflict) return res.status(409).json({ error: conflict });
+
+      const insertObj = {
+        id: studentId,
+        school_id: schoolId,
+        full_name: student.fullName,
+        class: student.class,
+        gender: student.gender || "Male",
+        guardian_phone: student.guardianPhone || "",
+        status: student.status || "active",
+        photo: student.photo || "",
+        date_of_birth: student.dateOfBirth || "",
+        address: student.address || "",
+        guardian_name: student.guardianName || "",
+        guardian_relationship: student.guardianRelationship || "",
+        guardian_phone_alt: student.guardianPhoneAlt || "",
+        section: student.section || "",
+        roll_number: student.rollNumber || "",
+        national_id: student.nationalId || "",
+        previous_school: student.previousSchool || "",
+        blood_group: student.bloodGroup || "",
+        medical_notes: student.medicalNotes || "",
+        created_at: createdAt,
+        updated_at: nowIso
+      };
+
+      const { data, error } = await supabase.from("dugsiga_students").insert([insertObj]).select("*").single();
+      if (error) {
+        if (error.code === "23505") return res.status(409).json({ error: "Student ID, Roll Number, ama National ID hore ayaa loo isticmaalay." });
+        throw error;
+      }
+
+      await recordStudentAudit(
+        req,
+        schoolId,
+        studentId,
+        "created",
+        Object.keys(insertObj).filter((key) => !["school_id", "created_at", "updated_at"].includes(key)),
+        null,
+        data
+      );
+      return res.status(201).json(formatStudentRow(data, authUser));
+    }
+
+    const db = loadLocalDB();
+    const idConflict = (db.students || []).some((s: any) => s.id === studentId);
+    if (idConflict) return res.status(409).json({ error: "Student ID-gan horey ayaa loo isticmaalay." });
+
+    const conflict = (db.students || []).some((s: any) =>
+      s.schoolId === schoolId &&
+      s.id !== studentId &&
+      (
+        (student.rollNumber &&
+          (s.rollNumber || "").trim().toLowerCase() === student.rollNumber.toLowerCase() &&
+          String(s.class || "").trim().toLowerCase() === String(student.class || "").trim().toLowerCase() &&
+          String(s.section || "").trim().toLowerCase() === String(student.section || "").trim().toLowerCase()) ||
+        (student.nationalId && (s.nationalId || "").trim().toLowerCase() === student.nationalId.toLowerCase())
+      )
+    );
+    if (conflict) return res.status(409).json({ error: "Xogtan waxay la mid tahay arday hore." });
+
+    const fullStudent = { ...student, id: studentId, schoolId, createdAt, updatedAt: nowIso };
+    db.students.push(fullStudent);
+    saveLocalDB(db);
+    return res.status(201).json(fullStudent);
+  } catch (e: any) {
+    return handleStudentSupabaseError(res, e, "Diiwaangelinta Ardayga (Add Student)");
+  }
+});
+
+app.put("/api/students/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+  if (!isSafeStudentId(id)) return res.status(400).json({ error: "Student ID-ga ma saxna." });
+
+  const validation = validateStudentPayload(req.body, { partial: true });
+  if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+  const updates = validation.value;
+  const mutableKeys = ["fullName","class","gender","guardianPhone","status","photo","dateOfBirth","address","guardianName","guardianRelationship","guardianPhoneAlt","emergencyContact","section","rollNumber","nationalId","previousSchool","bloodGroup","medicalNotes"];
+  const changedKeys = mutableKeys.filter((key) => Object.prototype.hasOwnProperty.call(updates, key));
+  if (changedKeys.length === 0) return res.status(400).json({ error: "Wax isbeddel ah lama helin." });
+
+  try {
+    if (!useLocalFallback) {
+      const { data: current, error: currentError } = await supabase
+        .from("dugsiga_students")
+        .select("*")
+        .eq("school_id", schoolId)
+        .eq("id", id)
+        .maybeSingle();
+      if (currentError) throw currentError;
+      if (!current) return res.status(404).json({ error: "Ardayga lama helin." });
+
+      if (
+        updates.fullName !== undefined &&
+        String(updates.fullName).trim() !== String(current.full_name || '').trim() &&
+        String(updates.fullName).trim().split(/\s+/).filter(Boolean).length < 2
+      ) {
+        return res.status(400).json({ error: "Magaca cusub waa inuu leeyahay ugu yaraan 2 magac." });
+      }
+
+      const nextClass = updates.class ?? current.class;
+      if (
+        (updates.class !== undefined || updates.section !== undefined) &&
+        !(await studentClassExists(
+          schoolId,
+          String(nextClass),
+          String(updates.section ?? current.section ?? '')
+        ))
+      ) {
+        return res.status(400).json({ error: "Fasalka cusub kama jiro school-kan." });
+      }
+      const nextStatus = updates.status ?? current.status ?? 'active';
+      const becomesActive =
+        String(nextStatus).toLowerCase() === 'active' &&
+        String(current.status || 'active').toLowerCase() !== 'active';
+
+      const classChanged =
+        updates.class !== undefined &&
+        String(nextClass).trim() !== String(current.class || '').trim();
+
+      const sectionChanged =
+        updates.section !== undefined &&
+        String(updates.section ?? '').trim() !== String(current.section || '').trim();
+
+      if ((classChanged || sectionChanged || becomesActive) &&
+          String(nextStatus).toLowerCase() !== 'archived') {
+        const capacity = await assertStudentClassCapacity(
+          schoolId,
+          String(nextClass),
+          1,
+          [id],
+          String(updates.section ?? current.section ?? '')
+        );
+        if (!capacity.ok) return res.status(409).json({ error: capacity.error });
+      }
+
+      const candidate = {
+        id,
+        fullName: updates.fullName ?? current.full_name,
+        class: nextClass,
+        rollNumber: updates.rollNumber ?? current.roll_number,
+        nationalId: updates.nationalId ?? current.national_id,
+        section: updates.section ?? current.section ?? ''
+      };
+      const conflict = await findStudentUniquenessConflict(schoolId, candidate, id);
+      if (conflict) return res.status(409).json({ error: conflict });
+
+      const dbKey: Record<string, string> = {
+        fullName:"full_name", class:"class", gender:"gender", guardianPhone:"guardian_phone", status:"status",
+        photo:"photo", dateOfBirth:"date_of_birth", address:"address", guardianName:"guardian_name",
+        guardianRelationship:"guardian_relationship", guardianPhoneAlt:"guardian_phone_alt", emergencyContact:"emergency_contact", section:"section",
+        rollNumber:"roll_number", nationalId:"national_id", previousSchool:"previous_school",
+        bloodGroup:"blood_group", medicalNotes:"medical_notes"
+      };
+      const updateObj: any = { updated_at: new Date().toISOString() };
+      for (const key of changedKeys) updateObj[dbKey[key]] = updates[key];
+
+      const { data: updated, error } = await supabase.from("dugsiga_students").update(updateObj).eq("school_id", schoolId).eq("id", id).select("*").single();
+      if (error) {
+        if (error.code === "23505") return res.status(409).json({ error: "Student ID, Roll Number, ama National ID hore ayaa loo isticmaalay." });
+        throw error;
+      }
+
+      const oldStatus = String(current.status || "active");
+      const newStatus = String(updated.status || oldStatus);
+      const auditAction = oldStatus !== "archived" && newStatus === "archived" ? "archived" : oldStatus === "archived" && newStatus === "active" ? "restored" : "updated";
+      await recordStudentAudit(
+        req,
+        schoolId,
+        id,
+        auditAction,
+        changedKeys,
+        current,
+        updated
+      );
+      return res.json(formatStudentRow(updated, authUser));
+    }
+
+    const db = loadLocalDB();
+    const idx = db.students.findIndex((s: any) => s.id === id && s.schoolId === schoolId);
+    if (idx === -1) return res.status(404).json({ error: "Ardayga lama helin." });
+    const current = db.students[idx];
+    const duplicate = (db.students || []).some((s: any) =>
+      s.schoolId === schoolId && s.id !== id &&
+      (
+        (updates.rollNumber &&
+          (s.rollNumber || "").trim().toLowerCase() === updates.rollNumber.toLowerCase() &&
+          String(s.class || "").trim().toLowerCase() ===
+            String(updates.class ?? current.class ?? "").trim().toLowerCase() &&
+          String(s.section || "").trim().toLowerCase() ===
+            String(updates.section ?? current.section ?? "").trim().toLowerCase()) ||
+        (updates.nationalId && (s.nationalId || "").trim().toLowerCase() === updates.nationalId.toLowerCase())
+      )
+    );
+    if (duplicate) return res.status(409).json({ error: "Xogta cusub waxay la mid tahay arday hore." });
+
+    db.students[idx] = { ...current, ...updates, id, schoolId, updatedAt: new Date().toISOString() };
+    saveLocalDB(db);
+    return res.json({ success: true });
+  } catch (e: any) {
+    return handleStudentSupabaseError(res, e, "Tafatirka Ardayga (Update Student)");
+  }
+});
+
+
+app.get("/api/students/:id/attendance", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+  if (!isSafeStudentId(id)) return res.status(400).json({ error: "Student ID-ga ma saxna." });
+
+  try {
+    if (!useLocalFallback) {
+      const { data: student, error: studentError } = await supabase
+        .from("dugsiga_students")
+        .select("id,class,status")
+        .eq("school_id", schoolId)
+        .eq("id", id)
+        .maybeSingle();
+
+      if (studentError) throw studentError;
+      if (!student) return res.status(404).json({ error: "Ardayga lama helin." });
+
+      if (authUser.role === "teacher") {
+        const assigned = Array.isArray(authUser.assignedClasses)
+          ? authUser.assignedClasses.map((value) => String(value).trim()).filter(Boolean)
+          : [];
+        if (!assigned.includes(String(student.class || "").trim())) {
+          return res.status(403).json({ error: "Macallinku ma heli karo xaadiriska ardaygan." });
+        }
+      }
+
+      const { data, error } = await supabase
+        .from("dugsiga_attendance")
+        .select("date,student_id,status,timestamp,session_type")
+        .eq("school_id", schoolId)
+        .eq("student_id", id)
+        .order("date", { ascending: false })
+        .order("session_type", { ascending: true })
+        .limit(5000);
+
+      if (error) throw error;
+      return res.json((data || []).map((item: any) => ({
+        date: item.date,
+        studentId: item.student_id,
+        status: item.status,
+        timestamp: item.timestamp || "",
+        sessionType: item.session_type || "before_break"
+      })));
+    }
+
+    const db = loadLocalDB();
+    const student = (db.students || []).find((item: any) => item.id === id && item.schoolId === schoolId);
+    if (!student) return res.status(404).json({ error: "Ardayga lama helin." });
+
+    const history = (db.attendance || [])
+      .filter((item: any) => item.studentId === id && item.schoolId === schoolId)
+      .sort((a: any, b: any) => String(b.date || "").localeCompare(String(a.date || "")))
+      .slice(0, 5000);
+
+    return res.json(history);
+  } catch (e: any) {
+    return handleSupabaseError(res, e, "Soo qaadista xaadiriska ardayga");
+  }
+});
+
+app.get("/api/students/:id/audit", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+  if (!isSafeStudentId(id)) return res.status(400).json({ error: "Student ID-ga ma saxna." });
+
+  try {
+    if (!useLocalFallback) {
+      const { data: student, error: studentError } = await supabase
+        .from("dugsiga_students")
+        .select("id,class")
+        .eq("school_id", schoolId)
+        .eq("id", id)
+        .maybeSingle();
+
+      if (studentError) throw studentError;
+      if (!student) return res.status(404).json({ error: "Ardayga lama helin." });
+
+      if (authUser.role === "teacher") {
+        const assigned = Array.isArray(authUser.assignedClasses)
+          ? authUser.assignedClasses.map((c) => String(c).trim()).filter(Boolean)
+          : [];
+        if (!assigned.includes(String(student.class || "").trim())) {
+          return res.status(403).json({ error: "Macallinku ma heli karo taariikhda ardaygan." });
+        }
+      }
+
+      const { data, error } = await supabase
+        .from("dugsiga_student_audit")
+        .select("id,student_id,action,actor_email,actor_role,changed_fields,before_data,after_data,created_at")
+        .eq("school_id", schoolId)
+        .eq("student_id", id)
+        .order("created_at", { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      return res.json((data || []).map((item: any) => ({
+        id: item.id,
+        studentId: item.student_id,
+        action: item.action,
+        actorEmail: item.actor_email || "",
+        actorRole: item.actor_role || "",
+        changedFields: Array.isArray(item.changed_fields?.fields) ? item.changed_fields.fields : [],
+        beforeData: item.before_data || null,
+        afterData: item.after_data || null,
+        createdAt: item.created_at
+      })));
+    }
+
+    const db = loadLocalDB();
+    const student = (db.students || []).find((s: any) => s.id === id && s.schoolId === schoolId);
+    if (!student) return res.status(404).json({ error: "Ardayga lama helin." });
+
+    const auditRows = (db.studentAudit || [])
+      .filter((item: any) => item.schoolId === schoolId && item.studentId === id)
+      .sort((a: any, b: any) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+      .slice(0, 50);
+
+    return res.json(auditRows);
+  } catch (e: any) {
+    return handleSupabaseError(res, e, "Soo qaadista taariikhda ardayga");
+  }
+});
+
+app.delete("/api/students/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (!schoolId || !authUser) return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+
+  const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+  if (!isSafeStudentId(id)) return res.status(400).json({ error: "Student ID-ga ma saxna." });
+
+  try {
+    if (!useLocalFallback) {
+      const { data: current, error: currentError } = await supabase.from("dugsiga_students").select("*").eq("school_id", schoolId).eq("id", id).maybeSingle();
+      if (currentError) throw currentError;
+      if (!current) return res.status(404).json({ error: "Ardayga lama helin." });
+
+      const dependentIds = await getStudentDependencyIds([id], schoolId);
+      if (dependentIds.has(id)) {
+        return res.status(409).json({ error: "Ardaygan wuxuu leeyahay xog ku xiran. Isticmaal Archive halkii Delete." });
+      }
+
+      const { data: deleted, error } = await supabase.from("dugsiga_students").delete().eq("school_id", schoolId).eq("id", id).select("id");
+      if (error) throw error;
+      if (!deleted || deleted.length === 0) return res.status(404).json({ error: "Ardayga lama helin." });
+
+      await recordStudentAudit(req, schoolId, id, "deleted", ["student"], current, null);
+      return res.json({ success: true });
+    }
+
+    const db = loadLocalDB();
+    const current = db.students.find((s: any) => s.id === id && s.schoolId === schoolId);
+    if (!current) return res.status(404).json({ error: "Ardayga lama helin." });
+
+    const hasDependencies =
+      (db.fees || []).some((f: any) => f.studentId === id && f.schoolId === schoolId) ||
+      (db.attendance || []).some((a: any) => a.studentId === id && a.schoolId === schoolId) ||
+      (db.examScores || []).some((e: any) => e.studentId === id && e.schoolId === schoolId);
+    if (hasDependencies) return res.status(409).json({ error: "Ardaygan wuxuu leeyahay xog ku xiran. Isticmaal Archive." });
+
+    db.students = db.students.filter((s: any) => !(s.id === id && s.schoolId === schoolId));
+    saveLocalDB(db);
+    return res.json({ success: true });
+  } catch (e: any) {
+    return handleStudentSupabaseError(res, e, "Tirtirista Ardayga (Delete Student)");
+  }
+});
+
+app.get("/api/attendance", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+
+  if (!schoolId || !authUser) {
+    return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+  }
+
+  const rawDate = typeof req.query.date === "string" ? req.query.date : undefined;
+  const date = rawDate ? validateAttendanceDate(rawDate) : null;
+  const rawSession = typeof req.query.session_type === "string" ? req.query.session_type : undefined;
+  const session = rawSession ? normalizeAttendanceSession(rawSession) : undefined;
+
+  if (rawDate && !date) return res.status(400).json({ error: "Attendance date-ka ma saxna." });
+  if (rawSession && !session) return res.status(400).json({ error: "Attendance session-ka ma saxna." });
+
+  if (!useLocalFallback) {
+    try {
+      let query = supabase
+        .from("dugsiga_attendance")
+        .select("school_id,date,student_id,status,timestamp,session_type")
+        .eq("school_id", schoolId);
+
+      if (date) query = query.eq("date", date);
+      if (session) query = query.eq("session_type", session);
+
+      if (authUser.role === "teacher") {
+        const assignedClasses = Array.isArray(authUser.assignedClasses)
+          ? authUser.assignedClasses.map((item: unknown) => String(item).trim()).filter(Boolean)
+          : [];
+
+        if (assignedClasses.length === 0) return res.json([]);
+
+        const { data: allowedStudents, error: allowedError } = await supabase
+          .from("dugsiga_students")
+          .select("id")
+          .eq("school_id", schoolId)
+          .in("class", assignedClasses)
+          .eq("status", "active")
+          .limit(50000);
+
+        if (allowedError) throw allowedError;
+
+        const allowedIds = (allowedStudents || []).map((row: any) => String(row.id));
+        if (allowedIds.length === 0) return res.json([]);
+        query = query.in("student_id", allowedIds);
+      }
+
+      const { data, error } = await query.order("date", { ascending: false });
+      if (error) throw error;
+
+      const formatted = (data || []).map((row: any) => ({
+        date: row.date,
+        studentId: row.student_id,
+        status: row.status,
+        timestamp: row.timestamp,
+        sessionType: row.session_type || "before_break"
+      }));
+
+      return res.json(formatted);
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Soo qaadista Xaadirinta (Fetch Attendance)");
+    }
+  }
+
+  const db = loadLocalDB();
+  let list = (db.attendance || []).filter((row: any) => row.schoolId === schoolId);
+
+  if (date) list = list.filter((row: any) => row.date === date);
+  if (session) {
+    list = list.filter((row: any) => (row.sessionType || "before_break") === session);
+  }
+
+  if (authUser.role === "teacher") {
+    const assigned = new Set(
+      Array.isArray(authUser.assignedClasses)
+        ? authUser.assignedClasses.map((item: unknown) => String(item).trim()).filter(Boolean)
+        : []
+    );
+    list = list.filter((row: any) => {
+      const student = (db.students || []).find(
+        (item: any) => item.schoolId === schoolId && item.id === row.studentId
+      );
+      return student && assigned.has(String(student.class || "").trim()) && student.status === "active";
+    });
+  }
+
+  return res.json(list);
+});
+
+app.post("/api/attendance", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+
+  if (!schoolId || !authUser) {
+    return res.status(401).json({ error: "Session-ka lama xaqiijin." });
+  }
+
+  const date = validateAttendanceDate(req.body?.date);
+  if (!date) return res.status(400).json({ error: "Attendance date-ka ma saxna." });
+
+  const session = normalizeAttendanceSession(req.body?.session_type || "before_break");
+  if (!session) return res.status(400).json({ error: "Attendance session-ka ma saxna." });
+
+  if (!Array.isArray(req.body?.records)) {
+    return res.status(400).json({ error: "records waa inuu noqdaa array." });
+  }
+
+  const incoming = req.body.records;
+  if (incoming.length === 0) {
+    return res.status(400).json({ error: "Ugu yaraan hal attendance record ayaa loo baahan yahay." });
+  }
+
+  if (incoming.length > ATTENDANCE_MAX_RECORDS) {
+    return res.status(400).json({
+      error: `Hal mar kama badnaan karaan ${ATTENDANCE_MAX_RECORDS} attendance records.`
+    });
+  }
+
+  const recordsByStudent = new Map<string, {
+    studentId: string;
+    status: "Present" | "Absent" | "Late" | "Excused";
+  }>();
+
+  for (const [index, item] of incoming.entries()) {
+    const studentId = typeof item?.studentId === "string" ? item.studentId.trim() : "";
+    const status = normalizeAttendanceStatus(item?.status);
+
+    if (!studentId) {
+      return res.status(400).json({ error: `Attendance row ${index + 1}: studentId waa qasab.` });
+    }
+
+    if (!status) {
+      return res.status(400).json({ error: `Attendance row ${index + 1}: status-ku ma saxna.` });
+    }
+
+    if (studentId.length > 100) {
+      return res.status(400).json({ error: `Attendance row ${index + 1}: studentId aad buu u dheer yahay.` });
+    }
+
+    if (recordsByStudent.has(studentId)) {
+      return res.status(409).json({
+        error: `Ardayga ${studentId} laba jeer ayaa attendance-ka loogu daray.`
+      });
+    }
+
+    recordsByStudent.set(studentId, { studentId, status });
+  }
+
+  const normalizedRecords = Array.from(recordsByStudent.values());
+
+  if (!useLocalFallback) {
+    try {
+      const authorization = await getAttendanceAllowedStudents(
+        schoolId,
+        authUser,
+        normalizedRecords.map((record) => record.studentId)
+      );
+
+      if (authorization.error) {
+        return res.status(403).json({ error: authorization.error });
+      }
+
+      if (authorization.rows.length !== normalizedRecords.length) {
+        const allowedIds = new Set(authorization.rows.map((row: any) => String(row.id)));
+        const deniedIds = normalizedRecords
+          .map((record) => record.studentId)
+          .filter((id) => !allowedIds.has(id));
+
+        return res.status(403).json({
+          error: "Qaar ka mid ah ardayda looma oggola attendance-kan ama kama tirsana school-kan.",
+          deniedStudentIds: deniedIds.slice(0, 20)
+        });
+      }
+
+      const inactive = authorization.rows.find((row: any) => row.status !== "active");
+      if (inactive) {
+        return res.status(409).json({
+          error: "Attendance waxaa loo diiwaangelin karaa ardayda Active ah oo keliya."
+        });
+      }
+
+      const nowIso = new Date().toISOString();
+      const dbRecords = normalizedRecords.map((record) => ({
+        school_id: schoolId,
+        date,
+        student_id: record.studentId,
+        status: record.status,
+        timestamp: nowIso,
+        session_type: session
+      }));
+
+      const { data, error } = await supabase
+        .from("dugsiga_attendance")
+        .upsert(dbRecords, {
+          onConflict: "school_id,date,student_id,session_type",
+          ignoreDuplicates: false
+        })
+        .select("school_id,date,student_id,status,timestamp,session_type");
+
+      if (error) throw error;
+
+      return res.json({
+        success: true,
+        saved: (data || []).length,
+        date,
+        session_type: session
+      });
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Kaydinta Xaadirinta (Save Attendance)");
+    }
+  }
+
+  const db = loadLocalDB();
+  const studentRows = (db.students || []).filter(
+    (student: any) =>
+      student.schoolId === schoolId &&
+      normalizedRecords.some((record) => record.studentId === student.id)
+  );
+
+  const studentMap = new Map(studentRows.map((student: any) => [student.id, student]));
+  for (const record of normalizedRecords) {
+    const student = studentMap.get(record.studentId);
+    if (!student || student.status !== "active") {
+      return res.status(403).json({
+        error: "Attendance waxaa loo diiwaangelin karaa ardayda Active ah oo keliya."
+      });
+    }
+
+    if (authUser.role === "teacher") {
+      const assigned = Array.isArray(authUser.assignedClasses)
+        ? authUser.assignedClasses.map((item: unknown) => String(item).trim()).filter(Boolean)
+        : [];
+
+      if (!assigned.includes(String(student.class || "").trim())) {
+        return res.status(403).json({ error: "Macallinku awood uma laha attendance-ka fasalkan." });
+      }
+    }
+  }
+
+  const incomingIds = new Set(normalizedRecords.map((record) => record.studentId));
+
+  // Scope the local upsert to only the submitted students. Saving one class/session
+  // must never delete attendance belonging to other classes.
+  db.attendance = (db.attendance || []).filter(
+    (row: any) =>
+      !(
+        row.schoolId === schoolId &&
+        row.date === date &&
+        (row.sessionType || "before_break") === session &&
+        incomingIds.has(String(row.studentId))
+      )
+  );
+
+  const nowIso = new Date().toISOString();
+  for (const record of normalizedRecords) {
+    db.attendance.push({
+      schoolId,
+      date,
+      studentId: record.studentId,
+      status: record.status,
+      timestamp: nowIso,
+      sessionType: session
+    });
+  }
+
+  saveLocalDB(db);
+  return res.json({
+    success: true,
+    saved: normalizedRecords.length,
+    date,
+    session_type: session
+  });
+});
+
+app.get("/api/fees", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!useLocalFallback) {
+    try {
+      const { data, error } = await supabase.from("dugsiga_fees").select("*").eq("school_id", schoolId);
+      if (error) throw error;
+      const formatted = data.map(f => ({ id: f.id, studentId: f.student_id, month: f.month, year: f.year, amount: parseFloat(f.amount), paidAmount: parseFloat(f.paid_amount), status: f.status, createdAt: f.created_at, updatedAt: f.updated_at, history: f.history || [] }));
+      return res.json(formatted);
+    } catch (e: any) { return handleSupabaseError(res, e, "Soo qaadista Biilasha (Fetch Fees)"); }
+  } else {
+    const db = loadLocalDB();
+    const list = (db.fees || []).filter((f: any) => f.schoolId === schoolId);
+    res.json(list);
+  }
+});
+
+app.post("/api/fees", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (authUser?.role === "teacher") {
+    return res.status(403).json({ error: "Macallimiintu awood uma laha abuurista biilasha ardayda." });
+  }
+
+  const fee = req.body;
+  if (!fee.studentId || !fee.month || !fee.year) return res.status(400).json({ error: "Missing required fields" });
+  
+  const feeId = fee.id || 'fee-' + Math.random().toString(36).substring(2, 11);
+  const createdAt = fee.createdAt || new Date().toISOString();
+  const fullFee = { ...fee, id: feeId, createdAt };
+
+  if (!useLocalFallback) {
+    try {
+      const { data: existing, error: checkError } = await supabase.from("dugsiga_fees").select("id").eq("student_id", fee.studentId).eq("month", fee.month).eq("year", fee.year).eq("school_id", schoolId).limit(1);
+      if (checkError) throw checkError;
+      if (existing && existing.length > 0) return res.status(400).json({ error: "Biilka bishan ee ardaygan horey ayaa loo abuuray. (Duplicate Fee Record)" });
+      const { error } = await supabase.from("dugsiga_fees").insert([{ 
+        id: feeId, 
+        school_id: schoolId, 
+        student_id: fee.studentId, 
+        month: fee.month, 
+        year: fee.year, 
+        amount: fee.amount, 
+        paid_amount: fee.paidAmount !== undefined ? fee.paidAmount : (fee.paid_amount || 0), 
+        status: fee.status || 'unpaid', 
+        created_at: createdAt, 
+        updated_at: fee.updatedAt || createdAt, 
+        history: fee.history || [] 
+      }]);
+      if (error) throw error;
+      return res.json(fullFee);
+    } catch (e: any) { return handleSupabaseError(res, e, "Abuurista Biilka (Create Fee)"); }
+  } else {
+    const db = loadLocalDB();
+    const isDuplicate = (db.fees || []).some((f: any) => f.schoolId === schoolId && f.studentId === fee.studentId && f.month === fee.month && f.year === fee.year);
+    if (isDuplicate) return res.status(400).json({ error: "Biilka bishan ee ardaygan horey ayaa loo abuuray. (Duplicate Fee Record)" });
+    db.fees.push({ ...fullFee, schoolId });
+    saveLocalDB(db);
+    res.json(fullFee);
+  }
+});
+
+app.put("/api/fees/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const authUser = getAuthenticatedUser(req, loadLocalDB);
+  if (authUser?.role === "teacher") {
+    return res.status(403).json({ error: "Macallimiintu awood uma laha wax ka beddelka biilasha ardayda." });
+  }
+
+  const { id } = req.params;
+  const updates = req.body;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_fees").update({ month: updates.month, year: updates.year, amount: updates.amount, paid_amount: updates.paidAmount, status: updates.status, updated_at: updates.updatedAt, history: updates.history }).eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Cusbooneysiinta Biilka (Update Fee)"); }
+  } else {
+    const db = loadLocalDB();
+    const idx = db.fees.findIndex(f => f.id === id && f.schoolId === schoolId);
+    if (idx > -1) { db.fees[idx] = { ...db.fees[idx], ...updates }; saveLocalDB(db); return res.json({ success: true }); }
+    res.status(404).json({ error: "Fee not found" });
+  }
+});
+
+app.delete("/api/fees/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id } = req.params;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_fees").delete().eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Tirtirista Biilka (Delete Fee)"); }
+  } else {
+    const db = loadLocalDB();
+    db.fees = db.fees.filter(f => !(f.id === id && f.schoolId === schoolId));
+    saveLocalDB(db);
+    res.json({ success: true });
+  }
+});
+
+app.get("/api/classes", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!schoolId) {
+    return res.status(401).json({ error: "Fadlan mar kale gal akoonkaaga si aad u aragto fasallada." });
+  }
+
+  if (!useLocalFallback) {
+    try {
+      const { data, error } = await supabase
+        .from("dugsiga_classes")
+        .select("*")
+        .eq("school_id", schoolId)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      const formatted = (data || []).map((c: any) => ({
+        id: c.id,
+        className: c.class_name,
+        teacherName: c.teacher_name || "",
+        roomNumber: c.room_number || "",
+        description: c.description || "",
+        createdAt: c.created_at || ""
+      }));
+      return res.json(formatted);
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Soo qaadista Fasallada (Fetch Classes)");
+    }
+  }
+
+  const db = loadLocalDB();
+  return res.json((db.classes || []).filter((c: any) => c.schoolId === schoolId));
+});
+
+app.post("/api/classes", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!schoolId) {
+    return res.status(401).json({ error: "Fadhigaaga wuu dhacay. Fadlan mar kale gal akoonkaaga ka hor intaadan fasal abuurin." });
+  }
+
+  const { id, className, teacherName, roomNumber, description, createdAt } = req.body || {};
+  const cleanClassName = typeof className === "string" ? className.trim() : "";
+  if (!cleanClassName) return res.status(400).json({ error: "Magaca fasalka waa khasab." });
+
+  if (!useLocalFallback) {
+    try {
+      const { data: existing, error: checkError } = await supabase
+        .from("dugsiga_classes")
+        .select("id")
+        .eq("school_id", schoolId)
+        .ilike("class_name", cleanClassName)
+        .limit(1);
+      if (checkError) throw checkError;
+      if (existing?.length) {
+        return res.status(409).json({ error: "Fasalkan magacan leh horey ayaa loo diiwaangeliyey." });
+      }
+
+      const { error } = await supabase.from("dugsiga_classes").insert([{
+        id: id || "cls-" + crypto.randomUUID(),
+        school_id: schoolId,
+        class_name: cleanClassName,
+        teacher_name: typeof teacherName === "string" ? teacherName.trim() : "",
+        room_number: typeof roomNumber === "string" ? roomNumber.trim() : "",
+        description: typeof description === "string" ? description.trim() : "",
+        created_at: createdAt || new Date().toISOString().split("T")[0]
+      }]);
+      if (error) throw error;
+      return res.status(201).json({ success: true });
+    } catch (e: any) {
+      console.error("Class creation failed", {
+        code: String(e?.code || "UNKNOWN"),
+        message: String(e?.message || "Unknown database error").slice(0, 220),
+        schoolIdPresent: Boolean(schoolId),
+        databaseMode: "supabase"
+      });
+      return handleSupabaseError(res, e, "Kaydinta Fasalka (Save Class)");
+    }
+  }
+
+  const db = loadLocalDB();
+  if (!db.classes) db.classes = [];
+  const duplicate = db.classes.some((c: any) =>
+    c.schoolId === schoolId &&
+    String(c.className || "").trim().toLowerCase() === cleanClassName.toLowerCase()
+  );
+  if (duplicate) return res.status(409).json({ error: "Fasalkan magacan leh horey ayaa loo diiwaangeliyey." });
+
+  db.classes.push({
+    id: id || "cls-" + crypto.randomUUID(),
+    schoolId,
+    className: cleanClassName,
+    teacherName: typeof teacherName === "string" ? teacherName.trim() : "",
+    roomNumber: typeof roomNumber === "string" ? roomNumber.trim() : "",
+    description: typeof description === "string" ? description.trim() : "",
+    createdAt: createdAt || new Date().toISOString().split("T")[0]
+  });
+  saveLocalDB(db);
+  return res.status(201).json({ success: true });
+});
+
+app.put("/api/classes/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!schoolId) return res.status(401).json({ error: "Fadlan mar kale gal akoonkaaga." });
+  const { id } = req.params;
+  const { className, teacherName, roomNumber, description } = req.body || {};
+  const cleanClassName = typeof className === "string" ? className.trim() : "";
+  if (!cleanClassName) return res.status(400).json({ error: "Magaca fasalka waa khasab." });
+
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_classes").update({
+        class_name: cleanClassName,
+        teacher_name: typeof teacherName === "string" ? teacherName.trim() : "",
+        room_number: typeof roomNumber === "string" ? roomNumber.trim() : "",
+        description: typeof description === "string" ? description.trim() : ""
+      }).eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Cusbooneysiinta Fasalka (Update Class)");
+    }
+  }
+
+  const db = loadLocalDB();
+  const idx = (db.classes || []).findIndex((c: any) => c.id === id && c.schoolId === schoolId);
+  if (idx < 0) return res.status(404).json({ error: "Fasalka lama helin." });
+  db.classes[idx] = { ...db.classes[idx], className: cleanClassName, teacherName: teacherName || "", roomNumber: roomNumber || "", description: description || "" };
+  saveLocalDB(db);
+  return res.json({ success: true });
+});
+
+app.delete("/api/classes/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!schoolId) return res.status(401).json({ error: "Fadlan mar kale gal akoonkaaga." });
+  const { id } = req.params;
+
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_classes").delete().eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) {
+      return handleSupabaseError(res, e, "Tirtirista Fasalka (Delete Class)");
+    }
+  }
+
+  const db = loadLocalDB();
+  db.classes = (db.classes || []).filter((c: any) => !(c.id === id && c.schoolId === schoolId));
+  saveLocalDB(db);
+  return res.json({ success: true });
+});
+
+app.get("/api/subjects", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!useLocalFallback) {
+    try {
+      const { data, error } = await supabase.from("dugsiga_subjects").select("*").eq("school_id", schoolId);
+      if (error) throw error;
+      const formatted = data.map(s => ({ id: s.id, subjectName: s.subject_name, subjectCode: s.subject_code, className: s.class_name, teacherName: s.teacher_name, createdAt: s.created_at }));
+      return res.json(formatted);
+    } catch (e: any) { return handleSupabaseError(res, e, "Soo qaadista Maddooyinka (Fetch Subjects)"); }
+  } else {
+    const db = loadLocalDB();
+    const list = (db.subjects || []).filter((s: any) => s.schoolId === schoolId);
+    res.json(list);
+  }
+});
+
+app.post("/api/subjects", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id, subjectName, subjectCode, className, teacherName, createdAt } = req.body;
+  if (!subjectName) return res.status(400).json({ error: "Subject name is required" });
+  if (!useLocalFallback) {
+    try {
+      const { data: existing, error: checkError } = await supabase.from("dugsiga_subjects").select("id").ilike("subject_name", subjectName.trim()).eq("class_name", className || "").eq("school_id", schoolId).limit(1);
+      if (checkError) throw checkError;
+      if (existing && existing.length > 0) return res.status(400).json({ error: "Maaddadan magacan leh horey ayaa loogu daray fasalkan. (Duplicate Subject)" });
+      const { error } = await supabase.from("dugsiga_subjects").insert([{ id: id || 'sub-' + Math.random().toString(36).substr(2, 9), school_id: schoolId, subject_name: subjectName.trim(), subject_code: subjectCode || "", class_name: className || "", teacher_name: teacherName || "", created_at: createdAt || new Date().toISOString().split('T')[0] }]);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Kaydinta Maaddada (Save Subject)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.subjects) db.subjects = [];
+    const isDuplicate = db.subjects.some(s => s.schoolId === schoolId && s.subjectName.trim().toLowerCase() === subjectName.trim().toLowerCase() && s.className === (className || ""));
+    if (isDuplicate) return res.status(400).json({ error: "Maaddadan magacan leh horey ayaa loogu daray fasalkan. (Duplicate Subject)" });
+    db.subjects.push({ id: id || 'sub-' + Math.random().toString(36).substr(2, 9), schoolId, subjectName: subjectName.trim(), subjectCode: subjectCode || "", className: className || "", teacherName: teacherName || "", createdAt: createdAt || new Date().toISOString().split('T')[0] });
+    saveLocalDB(db);
+    res.json({ success: true });
+  }
+});
+
+app.put("/api/subjects/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id } = req.params;
+  const { subjectName, subjectCode, className, teacherName } = req.body;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_subjects").update({ subject_name: subjectName, subject_code: subjectCode, class_name: className, teacher_name: teacherName }).eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Cusbooneysiinta Maaddada (Update Subject)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.subjects) db.subjects = [];
+    const idx = db.subjects.findIndex(s => s.id === id && s.schoolId === schoolId);
+    if (idx > -1) { db.subjects[idx] = { ...db.subjects[idx], subjectName, subjectCode, className, teacherName }; saveLocalDB(db); return res.json({ success: true }); }
+    res.status(404).json({ error: "Subject not found" });
+  }
+});
+
+app.delete("/api/subjects/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id } = req.params;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_subjects").delete().eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Tirtirista Maaddada (Delete Subject)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.subjects) db.subjects = [];
+    db.subjects = db.subjects.filter(s => !(s.id === id && s.schoolId === schoolId));
+    saveLocalDB(db);
+    res.json({ success: true });
+  }
+});
+
+app.get("/api/exams", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!useLocalFallback) {
+    try {
+      const { data, error } = await supabase.from("dugsiga_exam_scores").select("*").eq("school_id", schoolId);
+      if (error) throw error;
+      const formatted = data.map(e => ({ id: e.id, studentId: e.student_id, studentName: e.student_name, className: e.class_name, subjectName: e.subject_name, examName: e.exam_name, term: e.term, maxMarks: Number(e.max_marks || 100), marksObtained: Number(e.marks_obtained), grade: e.grade, examDate: e.exam_date, createdAt: e.created_at }));
+      return res.json(formatted);
+    } catch (e: any) { return handleSupabaseError(res, e, "Soo qaadista Imtixaanada (Fetch Exams)"); }
+  } else {
+    const db = loadLocalDB();
+    const list = (db.examScores || []).filter((e: any) => e.schoolId === schoolId);
+    res.json(list);
+  }
+});
+
+app.post("/api/exams", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id, studentId, studentName, className, subjectName, examName, term, maxMarks, marksObtained, grade, examDate, createdAt } = req.body;
+  if (!studentId || !className || !subjectName || !examName || marksObtained === undefined) return res.status(400).json({ error: "Missing required fields for exam score recording" });
+  if (!useLocalFallback) {
+    try {
+      const { data: existing, error: checkError } = await supabase.from("dugsiga_exam_scores").select("id").eq("student_id", studentId).eq("subject_name", subjectName).eq("exam_name", examName).eq("school_id", schoolId).limit(1);
+      if (checkError) throw checkError;
+      if (existing && existing.length > 0) return res.status(400).json({ error: "Natiijadan imtixaanka ee ardaygan horey ayaa loo duubay. (Duplicate Exam Score)" });
+      const { error } = await supabase.from("dugsiga_exam_scores").insert([{ id: id || 'exm-' + Math.random().toString(36).substr(2, 9), school_id: schoolId, student_id: studentId, student_name: studentName || "", class_name: className, subject_name: subjectName, exam_name: examName, term: term || "Term 1", max_marks: maxMarks || 100, marks_obtained: marksObtained, grade: grade || "", exam_date: examDate || new Date().toISOString().split('T')[0], created_at: createdAt || new Date().toISOString().split('T')[0] }]);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Kaydinta Natiijada Imtixaanka (Save Exam Score)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.examScores) db.examScores = [];
+    const isDuplicate = db.examScores.some(e => e.schoolId === schoolId && e.studentId === studentId && e.subjectName === subjectName && e.examName === examName);
+    if (isDuplicate) return res.status(400).json({ error: "Natiijadan imtixaanka ee ardaygan horey ayaa loo duubay. (Duplicate Exam Score)" });
+    db.examScores.push({ id: id || 'exm-' + Math.random().toString(36).substr(2, 9), schoolId, studentId, studentName: studentName || "", className, subjectName, examName, term: term || "Term 1", maxMarks: maxMarks || 100, marksObtained, grade: grade || "", examDate: examDate || new Date().toISOString().split('T')[0], createdAt: createdAt || new Date().toISOString().split('T')[0] });
+    saveLocalDB(db);
+    res.json({ success: true });
+  }
+});
+
+app.put("/api/exams/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id } = req.params;
+  const { studentId, studentName, className, subjectName, examName, term, maxMarks, marksObtained, grade, examDate } = req.body;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_exam_scores").update({ student_id: studentId, student_name: studentName, class_name: className, subject_name: subjectName, exam_name: examName, term: term, max_marks: maxMarks, marks_obtained: marksObtained, grade: grade, exam_date: examDate }).eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Cusbooneysiinta Natiijada Imtixaanka (Update Exam Score)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.examScores) db.examScores = [];
+    const idx = db.examScores.findIndex(e => e.id === id && e.schoolId === schoolId);
+    if (idx > -1) { db.examScores[idx] = { ...db.examScores[idx], studentId, studentName, className, subjectName, examName, term, maxMarks, marksObtained, grade, examDate }; saveLocalDB(db); return res.json({ success: true }); }
+    res.status(404).json({ error: "Exam score record not found" });
+  }
+});
+
+app.delete("/api/exams/:id", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const { id } = req.params;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_exam_scores").delete().eq("id", id).eq("school_id", schoolId);
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Tirtirista Natiijada (Delete Exam Score)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.examScores) db.examScores = [];
+    db.examScores = db.examScores.filter(e => !(e.id === id && e.schoolId === schoolId));
+    saveLocalDB(db);
+    res.json({ success: true });
+  }
+});
+
+app.get("/api/settings", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!useLocalFallback) {
+    try {
+      const { data, error } = await supabase.from("dugsiga_settings").select("*").eq("school_id", schoolId).eq("key", "main_settings").single();
+      if (error && error.code !== "PGRST116") throw error;
+      if (data) return res.json(data.value);
+      return res.json({ ...defaultSettings, schoolName: schoolId.includes("@") ? schoolId.split("@")[0].toUpperCase() : "Dugsiga Pro 2026" });
+    } catch (e: any) { return handleSupabaseError(res, e, "Soo qaadista Qaabeynta (Fetch Settings)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.settings || typeof db.settings.schoolName === 'string') {
+      const oldVal = db.settings || defaultSettings;
+      db.settings = { "default-school": oldVal };
+    }
+    const schoolSettings = db.settings[schoolId] || { ...defaultSettings, schoolName: schoolId.includes("@") ? schoolId.split("@")[0].toUpperCase() : "Dugsiga Pro 2026" };
+    res.json(schoolSettings);
+  }
+});
+
+app.put("/api/settings", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  const settings = req.body;
+  if (!useLocalFallback) {
+    try {
+      const { error } = await supabase.from("dugsiga_settings").upsert({ school_id: schoolId, key: "main_settings", value: settings });
+      if (error) throw error;
+      return res.json({ success: true });
+    } catch (e: any) { return handleSupabaseError(res, e, "Kaydinta Qaabeynta (Update Settings)"); }
+  } else {
+    const db = loadLocalDB();
+    if (!db.settings || typeof db.settings.schoolName === 'string') {
+      const oldVal = db.settings || defaultSettings;
+      db.settings = { "default-school": oldVal };
+    }
+    db.settings[schoolId] = { ...(db.settings[schoolId] || defaultSettings), ...settings };
+    saveLocalDB(db);
+    res.json({ success: true });
+  }
+});
+
+// Register Modernization & Extension Routes (Teachers, Staff, Guardians, Attendance, Timetable, Admissions, Library, Inventory, Announcements, Reports, RBAC)
+registerModernRoutes(app, {
+  getSchoolId,
+  loadLocalDB,
+  saveLocalDB,
+  supabase,
+  getUseLocalFallback: () => useLocalFallback,
+  hasPermission,
+  handleSupabaseError
+});
+
+// Register Complete Finance & Accounting Suite
+registerFinanceRoutes(app, {
+  getSchoolId,
+  loadLocalDB,
+  saveLocalDB,
+  supabase,
+  getUseLocalFallback: () => useLocalFallback,
+  hasPermission,
+  handleSupabaseError
+});
+
+app.post("/api/reset", async (req, res) => {
+  const schoolId = getSchoolId(req);
+  if (!useLocalFallback) {
+    try {
+      const { error: err1 } = await supabase.from("dugsiga_students").delete().eq("school_id", schoolId);
+      if (err1) throw err1;
+      const { error: err2 } = await supabase.from("dugsiga_fees").delete().eq("school_id", schoolId);
+      if (err2) throw err2;
+      const { error: err3 } = await supabase.from("dugsiga_attendance").delete().eq("school_id", schoolId);
+      if (err3) throw err3;
+      const { error: err4 } = await supabase.from("dugsiga_exam_scores").delete().eq("school_id", schoolId);
+      if (err4) throw err4;
+      const { error: err5 } = await supabase.from("dugsiga_classes").delete().eq("school_id", schoolId);
+      if (err5) throw err5;
+      const { error: err6 } = await supabase.from("dugsiga_subjects").delete().eq("school_id", schoolId);
+      if (err6) throw err6;
+      const { error: err7 } = await supabase.from("dugsiga_settings").delete().eq("school_id", schoolId).eq("key", "main_settings");
+      if (err7) throw err7;
+    } catch (e: any) { return handleSupabaseError(res, e, "Factory Reset"); }
+  }
+  const db = loadLocalDB();
+  db.students = (db.students || []).filter((s: any) => s.schoolId !== schoolId);
+  db.fees = (db.fees || []).filter((f: any) => f.schoolId !== schoolId);
+  db.attendance = (db.attendance || []).filter((a: any) => a.schoolId !== schoolId);
+  db.examScores = (db.examScores || []).filter((e: any) => e.schoolId !== schoolId);
+  db.classes = (db.classes || []).filter((c: any) => c.schoolId !== schoolId);
+  db.subjects = (db.subjects || []).filter((s: any) => s.schoolId !== schoolId);
+  if (db.teachers) db.teachers = db.teachers.filter((t: any) => t.schoolId !== schoolId);
+  if (db.staff) db.staff = db.staff.filter((s: any) => s.schoolId !== schoolId);
+  if (db.guardians) db.guardians = db.guardians.filter((g: any) => g.schoolId !== schoolId);
+  if (db.staffAttendance) db.staffAttendance = db.staffAttendance.filter((a: any) => a.schoolId !== schoolId);
+  if (db.timetable) db.timetable = db.timetable.filter((t: any) => t.schoolId !== schoolId);
+  if (db.admissions) db.admissions = db.admissions.filter((a: any) => a.schoolId !== schoolId);
+  if (db.announcements) db.announcements = db.announcements.filter((a: any) => a.schoolId !== schoolId);
+  if (db.libraryBooks) db.libraryBooks = db.libraryBooks.filter((b: any) => b.schoolId !== schoolId);
+  if (db.libraryLoans) db.libraryLoans = db.libraryLoans.filter((l: any) => l.schoolId !== schoolId);
+  if (db.inventory) db.inventory = db.inventory.filter((i: any) => i.schoolId !== schoolId);
+  if (db.documents) db.documents = db.documents.filter((d: any) => d.schoolId !== schoolId);
+  if (db.notifications) db.notifications = db.notifications.filter((n: any) => n.schoolId !== schoolId);
+  if (db.feeStructures) db.feeStructures = db.feeStructures.filter((fs: any) => fs.schoolId !== schoolId);
+  if (db.invoices) db.invoices = db.invoices.filter((inv: any) => inv.schoolId !== schoolId);
+  if (db.payments) db.payments = db.payments.filter((p: any) => p.schoolId !== schoolId);
+  if (db.expenses) db.expenses = db.expenses.filter((e: any) => e.schoolId !== schoolId);
+  if (db.income) db.income = db.income.filter((inc: any) => inc.schoolId !== schoolId);
+  if (db.budgets) db.budgets = db.budgets.filter((b: any) => b.schoolId !== schoolId);
+  if (db.payroll) db.payroll = db.payroll.filter((pr: any) => pr.schoolId !== schoolId);
+  if (db.settings && typeof db.settings === 'object' && !db.settings.schoolName) {
+    delete db.settings[schoolId];
+  } else {
+    db.settings = {};
+  }
+  saveLocalDB(db);
+  res.json({ success: true });
+});
+
+async function startServer() {
+  app.use(express.static(path.join(process.cwd(), "public")));
+
+  const distPath = path.join(process.cwd(), "dist");
+  const distIndexHtml = path.join(distPath, "index.html");
+  const isDevLifecycle =
+    process.env.npm_lifecycle_event === "dev" ||
+    process.env.NODE_ENV === "development";
+  const useStaticDist = !isDevLifecycle && fs.existsSync(distIndexHtml);
+
+  if (!useStaticDist) {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      if (fs.existsSync(distIndexHtml)) {
+        res.sendFile(distIndexHtml);
+      } else {
+        res.status(404).send("Application build not found.");
+      }
+    });
+  }
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error("Fatal error starting server:", err);
+  process.exit(1);
+});

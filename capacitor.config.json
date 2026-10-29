@@ -1,0 +1,12 @@
+{
+  "appId": "com.dugsipro.app",
+  "appName": "Quantora",
+  "webDir": "dist-mobile",
+  "bundledWebRuntime": false,
+  "ios": {
+    "contentInset": "automatic"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
