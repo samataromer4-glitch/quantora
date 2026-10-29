@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -31,10 +32,14 @@ const routeConfig = read("src/app/routeConfig.ts");
 const migration = read("supabase/migrations/20261029090000_secure_password_recovery.sql");
 const tests = read("tests/password-recovery.test.ts");
 const deployment = read("docs/PASSWORD_RECOVERY.md");
+const envExample = read(".env.example");
 
 assertContains(server, 'app.post("/api/auth/password-recovery"', "recovery request endpoint is registered");
 assertContains(server, 'app.post("/api/auth/password-recovery/validate"', "token validation endpoint is registered");
 assertContains(server, 'app.post("/api/auth/password-reset"', "password reset endpoint is registered");
+assertContains(server, 'return res.status(410).json({', "unimplemented email verification cannot report success");
+assertContains(server, "Xaqiijinta email-ka weli lama hawlgelin", "verification endpoint explains that proof is not configured");
+assertNotContains(server, "Verification step is disabled. Automated success.", "verification endpoint never fakes success");
 assertContains(server, "PASSWORD_RECOVERY_GENERIC_RESPONSE", "request endpoint uses a generic response");
 assertContains(server, '`request:ip:${ip}`', "recovery requests have per-IP rate limits");
 assertContains(server, '`request:email:${emailKey}`', "recovery requests have per-email flood limits");
@@ -55,7 +60,21 @@ assertNotContains(recovery, "localStorage", "recovery tokens are never stored in
 assertContains(email, "sendPasswordRecoveryEmail", "recovery email uses the existing SMTP service");
 assertContains(email, "getEmailTransporter()", "email delivery respects existing SMTP configuration");
 assertContains(email, "Password recovery email delivery failed.", "delivery failures are logged without including secret data");
+assertNotContains(email, "no-reply@dugsigapro.edu", "sender never falls back to an invented address");
 assertNotContains(email, "[Activation Link]:", "invitation tokens are not logged");
+assertContains(envExample, 'SUPABASE_PUBLISHABLE_KEY="your_supabase_publishable_key"', "environment template names the publishable key");
+assertContains(envExample, 'EMAIL_USER=""', "environment template documents the legacy email username alias");
+assertContains(envExample, 'EMAIL_PASS=""', "environment template documents the legacy email password alias");
+const envAssignments = envExample
+  .split(/\r?\n/)
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith("#"));
+assert.ok(
+  envAssignments.every((line) => /^[A-Z][A-Z0-9_]*\s*=/.test(line)),
+  "environment template has no malformed variable assignments"
+);
+const envNames = envAssignments.map((line) => line.match(/^([A-Z][A-Z0-9_]*)\s*=/)[1]);
+assert.equal(new Set(envNames).size, envNames.length, "environment template has no duplicate variables");
 
 assertContains(migration, "token_hash TEXT NOT NULL UNIQUE", "database stores unique token digests");
 assertContains(migration, "ENABLE ROW LEVEL SECURITY", "recovery-token table enables row-level security");

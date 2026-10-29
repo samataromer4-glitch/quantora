@@ -355,8 +355,8 @@ export function registerTeacherAuthRoutes(
         activationLink,
         expiresInDays: 7
       });
-    } catch (error: any) {
-      console.warn("Teacher invitation email failed:", String(error?.message || error).slice(0, 160));
+    } catch {
+      console.warn("Teacher invitation email delivery failed.");
       emailResult = { success: false };
     }
 

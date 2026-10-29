@@ -10,6 +10,16 @@ interface SendInvitationEmailParams {
 
 let cachedTransporter: Transporter | null = null;
 
+const EMAIL_ADDRESS_PATTERN = /^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?$/i;
+
+function getConfiguredSenderAddress(): string | null {
+  const sender = process.env.SMTP_FROM?.trim() ||
+    process.env.SMTP_USER?.trim() ||
+    process.env.EMAIL_USER?.trim() ||
+    "";
+  return EMAIL_ADDRESS_PATTERN.test(sender) ? sender : null;
+}
+
 function getEmailTransporter(): Transporter | null {
   if (cachedTransporter) return cachedTransporter;
 
@@ -48,8 +58,13 @@ export async function sendTeacherInvitationEmail({
   schoolName,
   activationLink,
   expiresInDays = 7
-}: SendInvitationEmailParams): Promise<{ success: boolean; error?: string; simulated?: boolean }> {
-  const fromEmail = process.env.SMTP_FROM || process.env.SMTP_USER || "no-reply@dugsigapro.edu";
+}: SendInvitationEmailParams): Promise<{ success: boolean; error?: string }> {
+  const fromEmail = getConfiguredSenderAddress();
+  if (!fromEmail) {
+    console.error("Invitation email was not sent because no valid sender address is configured.");
+    return { success: false, error: "Email sender is not configured" };
+  }
+
   const cleanEmail = toEmail.trim().toLowerCase();
 
   const htmlContent = `
@@ -125,15 +140,15 @@ Link-gani wuxuu dhacayaa ${expiresInDays} maalmood gudahood.
 
   const transporter = getEmailTransporter();
   if (!transporter) {
-    console.log("[Email Service Notice] SMTP not configured; invitation email was not delivered.");
+    console.warn("SMTP is not configured; invitation email was not delivered.");
     return {
-      success: true,
-      simulated: true
+      success: false,
+      error: "SMTP is not configured"
     };
   }
 
   try {
-    const info = await transporter.sendMail({
+    await transporter.sendMail({
       from: `"${schoolName}" <${fromEmail}>`,
       to: cleanEmail,
       subject: `Casuumaad Macallin: Ku soo dhowow ${schoolName} (Dhaqaaji Akoonkaaga)`,
@@ -141,7 +156,7 @@ Link-gani wuxuu dhacayaa ${expiresInDays} maalmood gudahood.
       html: htmlContent
     });
 
-    console.log(`[Email Service] Invitation email sent to ${cleanEmail}: ${info.messageId}`);
+    console.log("[Email Service] Invitation email sent.");
     return { success: true };
   } catch {
     console.error("[Email Service Error] Invitation email delivery failed.");
@@ -153,13 +168,18 @@ export async function sendPasswordRecoveryEmail(
   toEmail: string,
   recoveryLink: string
 ): Promise<boolean> {
+  const fromEmail = getConfiguredSenderAddress();
+  if (!fromEmail) {
+    console.error("Password recovery email was not sent because no valid sender address is configured.");
+    return false;
+  }
+
   const transporter = getEmailTransporter();
   if (!transporter) {
     console.warn("Password recovery email was not sent because SMTP is not configured.");
     return false;
   }
 
-  const fromEmail = process.env.SMTP_FROM || process.env.SMTP_USER || "no-reply@dugsigapro.edu";
   try {
     await transporter.sendMail({
       from: `"DUGSI PRO" <${fromEmail}>`,

@@ -19,7 +19,10 @@ assert.equal(capacitor.webDir, 'dist-mobile');
 assert.match(packageJson.scripts['build:mobile'], /vite build --mode mobile/);
 assert.match(vite, /outDir: isMobileBuild \? 'dist-mobile' : 'dist'/);
 assert.match(vite, /base: isMobileBuild \? '\.\/' : '\/'/);
-assert.match(env, /^VITE_API_BASE_URL=https:\/\/samatar-project\.onrender\.com\s*$/m);
+const configuredApiUrl = env.match(/^VITE_API_BASE_URL=(https:\/\/\S+)\s*$/m)?.[1];
+assert.ok(configuredApiUrl, 'native builds must configure a remote HTTPS Express API URL');
+assert.equal(new URL(configuredApiUrl).protocol, 'https:');
+assert.doesNotMatch(configuredApiUrl, /localhost|127\.0\.0\.1/i, 'native API cannot target the build host');
 assert.match(apiClient, /VITE_API_BASE_URL/);
 assert.match(apiClient, /X-Dugsi-Client/);
 assert.match(server, /capacitor:\/\/localhost/);
@@ -46,4 +49,4 @@ assert.doesNotMatch(iconGenerator, /isFrameOuter/, 'old bright cyan outer frame 
 assert.match(styles, /mobile-safe-bottom/);
 assert.match(styles, /prefers-reduced-motion/);
 
-console.log('Mobile contract checks passed: isolated bundle, shared Render API, native CORS and token gating.');
+console.log('Mobile contract checks passed: isolated bundle, configured remote API, native CORS and token gating.');

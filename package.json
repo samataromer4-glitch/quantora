@@ -24,7 +24,7 @@
     "test:database-source-contract": "node scripts/database-source-contract.mjs",
     "test:finance-source-contract": "node scripts/finance-source-contract.mjs",
     "test:auth-cloud-contract": "node scripts/auth-cloud-source-contract.mjs",
-    "test:password-recovery": "node --import tsx --test tests/password-recovery.test.ts && node scripts/password-recovery-contract.mjs",
+    "test:password-recovery": "node --import tsx --test tests/password-recovery.test.ts tests/email-service.test.ts && node scripts/password-recovery-contract.mjs",
     "test:tenant-boundary-contract": "node scripts/tenant-boundary-contract.mjs",
     "test:migration-history-contract": "node scripts/migration-history-contract.mjs"
   },

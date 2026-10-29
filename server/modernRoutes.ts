@@ -240,8 +240,8 @@ export function registerModernRoutes(app: express.Express, helpers: ModernRouteH
           expiresInDays: 7
         });
         emailSent = mailResult.success;
-      } catch (err) {
-        console.warn("Could not send teacher invitation email:", err);
+      } catch {
+        console.warn("Teacher invitation email delivery failed.");
       }
     }
 

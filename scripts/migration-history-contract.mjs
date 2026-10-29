@@ -51,21 +51,28 @@ assert.deepEqual(
   "Every migration recorded in the Supabase project must have its timestamped SQL file in Git."
 );
 
-for (const file of recordedRemoteMigrations) {
+const appliedFinanceMigration = "20261021173729_atomic_finance_transactions.sql";
+assert.ok(sqlFiles.includes(appliedFinanceMigration), "Atomic finance migration is missing.");
+const historicalMigrations = [...recordedRemoteMigrations, appliedFinanceMigration];
+for (const file of historicalMigrations) {
   const content = readFileSync(path.join(migrationDirectory, file), "utf8");
   assert.ok(content.trim().length > 0, `Recorded migration is empty: ${file}`);
 }
 
-const pendingFinanceMigration = "20261021173729_atomic_finance_transactions.sql";
-assert.ok(sqlFiles.includes(pendingFinanceMigration), "Atomic finance migration is missing.");
+const recoveryMigrationCandidate = "20261029090000_secure_password_recovery.sql";
+assert.ok(sqlFiles.includes(recoveryMigrationCandidate), "Password recovery migration candidate is missing.");
+assert.ok(
+  !historicalMigrations.includes(recoveryMigrationCandidate),
+  "The password recovery candidate must not be presented as part of the previously verified remote migration history."
+);
 const timestamps = sqlFiles.map((file) => file.slice(0, 14));
 assert.equal(new Set(timestamps).size, timestamps.length, "Migration timestamps must be unique.");
 assert.ok(
-  Number(pendingFinanceMigration.slice(0, 14)) >
+  Number(appliedFinanceMigration.slice(0, 14)) >
     Math.max(...recordedRemoteMigrations.map((file) => Number(file.slice(0, 14)))),
-  "The staged finance migration must follow the existing remote migration history."
+  "The recorded finance migration must follow the preceding migration history."
 );
 
 console.log(
-  `Supabase migration history contract passed: ${recordedRemoteMigrations.length} recorded migrations are versioned in Git, with the atomic finance migration staged after them.`
+  `Supabase migration history contract passed: ${historicalMigrations.length} historically recorded migrations are versioned in Git; password-recovery SQL remains an unverified candidate.`
 );

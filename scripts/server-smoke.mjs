@@ -81,6 +81,16 @@ try {
     throw new Error(`GET /api/user/profile expected 401 without a session, got ${session.status}`);
   }
 
+  const verification = await fetch(`${baseUrl}/api/auth/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({})
+  });
+  const verificationBody = await verification.json();
+  if (verification.status !== 410 || verificationBody.success !== false) {
+    throw new Error(`POST /api/auth/verify must reject requests without proof; received ${verification.status}: ${JSON.stringify(verificationBody)}`);
+  }
+
   const recoveryWhileDatabaseUnavailable = await fetch(`${baseUrl}/api/auth/password-recovery`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

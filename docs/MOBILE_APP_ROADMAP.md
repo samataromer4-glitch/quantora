@@ -1,14 +1,16 @@
 # DUGSI PRO Web + Mobile Delivery Roadmap
 
 **Status:** Capacitor implementation is being prepared on a dedicated GitHub branch; native scaffolds and CI must pass before merging.  
-**Existing production:** React 19 + TypeScript + Vite web SPA served by Express on Render  
+**Existing app:** React 19 + TypeScript + Vite web SPA served by Express
 **Database:** Existing Supabase project and `dugsiga_*` tables  
 **Allowed application roles:** `admin` and `teacher` only  
 **Out of scope:** Guardian/student sign-in, a second database, an immediate rewrite of the production web app
 
 ## 1. Architecture decision
 
-Keep the current web application and Render service running. Package the existing React/Vite application with Capacitor for Android and iOS, using a distinct `dist-mobile/` web bundle so the native assets can never overwrite Render's `dist/server.cjs`. The mobile build targets the shared Express API at `https://samatar-project.onrender.com`; it does not create a second backend or database. This first delivery reuses the responsive web UI inside the native WebView; genuinely native screens and platform-specific workflows remain later enhancements.
+Keep the current web application and its existing deployment configuration intact. Package the existing React/Vite application with Capacitor for Android and iOS, using a distinct `dist-mobile/` web bundle so the native assets cannot overwrite the web server build. The checked-in `.env.mobile` currently points API requests at `https://samatar-project.onrender.com`; this is an existing configuration value, not confirmation that the endpoint is active, maintained, or the current hosting provider. Before a mobile build/release, configure `VITE_API_BASE_URL` to a reachable Express API backend that supports these routes. The mobile app does not create a second backend or database. This first delivery reuses the responsive web UI inside the native WebView; genuinely native screens and platform-specific workflows remain later enhancements.
+
+The API backend must hold any Supabase secret/service-role credentials server-side. Never place those credentials in `VITE_*` variables, a mobile bundle, or native resources. A Supabase project URL alone is not a replacement for the Express API: the app's privileged endpoints require the configured backend.
 
 Keep one authoritative permission model. Resolve the school ID, account role and teacher's assigned classes on the server. The native UI may hide actions for usability, but the API must enforce every permission on every request.
 
@@ -62,7 +64,7 @@ Build Capacitor Android/iOS shells alongside the existing root React/Vite applic
 - Keep one configured API base URL in `.env.mobile`; this public URL is configuration, not a secret. Never place Supabase keys, SMTP credentials or session secrets in the mobile bundle.
 - Add secure session restoration with iOS Keychain / Android Keystore, bearer-token API calls, logout and a clear expired-session state. Refresh-token rotation and persistent device revocation remain a separate security gate before a commercial release.
 - Generate and commit the Android and iOS Capacitor projects; run `cap sync` whenever the web bundle or native plugin list changes.
-- Keep both `package-lock.json` and `bun.lock` synchronized so GitHub CI and Render installs remain deterministic.
+- Keep both `package-lock.json` and `bun.lock` synchronized so CI and supported package-manager installs remain deterministic.
 
 **Gate:** the app opens on Android and iOS, can sign in/sign out, handles invalid credentials and lost network gracefully, and the web deployment build is still green.
 
@@ -107,7 +109,7 @@ Do this only after online attendance is reliable.
 1. Ship preview builds to a small internal test group first.
 2. Validate on physical Android devices and an iOS simulator/device, with slow connections, expired sessions, app restarts and OS permission denial.
 3. Produce an Android APK for internal installation; produce Android App Bundle / iOS archive for stores only when the relevant store accounts, signing and ownership are ready.
-4. Use Android Gradle tooling for APK/AAB output and Xcode on macOS for iOS archives; code signing and store submission require the appropriate developer accounts. Render remains the web/API host; a mobile binary is not deployed to Render.
+4. Use Android Gradle tooling for APK/AAB output and Xcode on macOS for iOS archives; code signing and store submission require the appropriate developer accounts. A mobile binary is distributed through native app channels; it is not deployed to the server hosting provider.
 5. Release gradually, monitor API error rates and auth failures, and keep a rollback path for each API/schema change.
 
 **Gate:** release checklist signed off; no critical/high security defects; all P0 role and tenant-isolation tests pass; support and versioning details documented.
@@ -147,4 +149,4 @@ CI should retain the existing root web job and validate the separate `dist-mobil
 
 ## Recommended first implementation slice
 
-Finish the dedicated Capacitor feature branch first: regenerate both lockfiles, create native project scaffolds, run web and mobile-contract checks, validate the Render web build, and verify the restricted native CORS/token flow. Do not call this store-ready yet; refresh-token rotation, persistent revocation, real Android/iOS device testing and release signing must pass their later acceptance gates.
+Finish the dedicated Capacitor feature branch first: regenerate both lockfiles, create native project scaffolds, run web and mobile-contract checks, validate the selected web/API deployment target, and verify the restricted native CORS/token flow. Do not call this store-ready yet; refresh-token rotation, persistent revocation, real Android/iOS device testing and release signing must pass their later acceptance gates.

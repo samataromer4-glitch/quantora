@@ -420,7 +420,7 @@ try {
   console.error("Failed to initialize Supabase client:", err);
 }
 
-// ✅ NO EMAIL VERIFICATION - Auto verified
+// Registration currently activates accounts without proving email ownership.
 
 // Local database fallback with read-only filesystem resilience for Cloud Run
 const PRIMARY_DB_PATH = path.join(process.cwd(), "database.json");
@@ -1592,12 +1592,6 @@ function requiredPermissionForRequest(req: express.Request): string | null {
 
 // Password hashing is centralized in server/authSession.ts.
 
-// ✅ EMAIL VERIFICATION LA SAARAY - Auto verified
-async function sendVerificationEmail(toEmail: string, code: string) {
-  console.log(`Auto-verified user: ${toEmail} (no email required)`);
-  return true;
-}
-
 function expressWithSupabase(config: any, handler: any) {
   let webHandler: any = null;
   try {
@@ -2352,7 +2346,7 @@ app.use("/api", (req, res, next) => {
       "/docs/download/word",
       "/documentation-pdf"
     ].includes(req.path)) ||
-    (req.method === "POST" && req.path === "/auth/logout");
+    (req.method === "POST" && ["/auth/logout", "/auth/verify"].includes(req.path));
 
   if (
     process.env.NODE_ENV === "production" &&
@@ -2926,7 +2920,10 @@ app.post("/api/auth/signup", async (req, res) => {
 });
 
 app.post("/api/auth/verify", async (req, res) => {
-  res.json({ success: true, message: "Verification step is disabled. Automated success." });
+  return res.status(410).json({
+    success: false,
+    error: "Xaqiijinta email-ka weli lama hawlgelin. Akoon laguma xaqiijin karo codsigan."
+  });
 });
 
 app.post("/api/auth/logout", (req, res) => {
